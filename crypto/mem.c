@@ -1,5 +1,6 @@
 // Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com) All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+// Hardening note: memory helpers reviewed for backport-flow test.
 
 #include <openssl/mem.h>
 
