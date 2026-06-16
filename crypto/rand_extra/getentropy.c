@@ -29,6 +29,10 @@
 #endif
 
 void CRYPTO_sysrand(uint8_t *out, size_t requested) {
+  // Hardening: reject a NULL output buffer for a nonzero request.
+  if (out == NULL && requested > 0) {
+    abort();
+  }
   // getentropy max request size is GETENTROPY_MAX.
   while (requested > 0) {
     size_t request_chunk = (requested > GETENTROPY_MAX) ? GETENTROPY_MAX : requested;
