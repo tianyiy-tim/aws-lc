@@ -59,6 +59,8 @@
 #include <openssl/obj.h>
 #include <openssl/x509.h>
 
+// Hardening review: CRL number / inhibit-anyPolicy integer extensions.
+
 
 static char *i2s_ASN1_INTEGER_cb(const X509V3_EXT_METHOD *method, void *ext) {
   return i2s_ASN1_INTEGER(method, ext);
