@@ -11,6 +11,8 @@
 #include "../internal.h"
 #include "internal.h"
 
+// Hardening review: RSASSA-PSS ASN.1 parameter parsing (multi-branch backport demo).
+
 // Below macros are used with |get_context_specific_value|.
 #define TAG_VALUE_INDEX_0 0
 #define TAG_VALUE_INDEX_1 1
