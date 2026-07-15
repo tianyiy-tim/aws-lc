@@ -112,12 +112,25 @@ err:
 
 
 int DH_check(const DH *dh, int *out_flags) {
+<<<<<<< HEAD
   // Check that p is a safe prime and if g is 2, 3 or 5, check that it is a
   // suitable generator where:
   //   for 2, p mod 24 == 11
   //   for 3, p mod 12 == 5
   //   for 5, p mod 10 == 3 or 7
   // should hold.
+=======
+  *out_flags = 0;
+  if (!dh_check_params_fast(dh)) {
+    return 0;
+  }
+
+  if (dh_fast_path_from_safe_group(dh)) {
+    return 1;
+  }
+
+  // Check that p is a safe prime.
+>>>>>>> ac3aee310 (Recognise known safe DH groups/primes and short-circuit Diffie-Hellman test (#3337))
   int ok = 0, r, q_good = 0;
   BN_CTX *ctx = NULL;
   BN_ULONG l;
