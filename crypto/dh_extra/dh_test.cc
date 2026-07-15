@@ -1054,3 +1054,226 @@ TEST(DHTest, PrivateKeyLength) {
               BN_num_bits(DH_get0_priv_key(dh.get())));
   }
 }
+<<<<<<< HEAD
+=======
+
+// Test to make sure DH_check validates the standard DH parameters
+// from RFC 3526 and RFC 7919.
+TEST(DHTest, DHCheckForStandardParams) {
+  int flags;
+  bssl::UniquePtr<DH> dh1(DH_get_rfc7919_2048());
+  ASSERT_TRUE(DH_check(dh1.get(), &flags));
+  EXPECT_EQ(flags, 0);
+
+  bssl::UniquePtr<BIGNUM> p(BN_get_rfc3526_prime_2048(nullptr));
+  ASSERT_TRUE(p);
+  bssl::UniquePtr<BIGNUM> g(BN_new());
+  ASSERT_TRUE(g);
+  ASSERT_TRUE(BN_set_word(g.get(), 2));
+
+  bssl::UniquePtr<DH> dh2 = NewDHGroup(p.get(), /*q=*/nullptr, g.get());
+  ASSERT_TRUE(dh2);
+  ASSERT_TRUE(DH_check(dh2.get(), &flags));
+  EXPECT_EQ(flags, 0);
+}
+
+TEST(DHTest, DHCheckNamedGroupFastPath) {
+  auto make_bare_group = [](BIGNUM *p) -> bssl::UniquePtr<DH> {
+    bssl::UniquePtr<BIGNUM> p_owner(p);
+    if (p_owner == nullptr) {
+      return nullptr;
+    }
+    bssl::UniquePtr<BIGNUM> g(BN_new());
+    if (g == nullptr || !BN_set_word(g.get(), 2)) {
+      return nullptr;
+    }
+    // NewDHGroup does not take ownership; it dups the inputs.
+    return NewDHGroup(p_owner.get(), /*q=*/nullptr, g.get());
+  };
+
+  // All RFC 3526 MODP moduli, as a bare (p, g=2) group.
+  BIGNUM *(*const kRFC3526[])(BIGNUM *) = {
+      BN_get_rfc3526_prime_1536, BN_get_rfc3526_prime_2048,
+      BN_get_rfc3526_prime_3072, BN_get_rfc3526_prime_4096,
+      BN_get_rfc3526_prime_6144, BN_get_rfc3526_prime_8192,
+  };
+  for (auto getter : kRFC3526) {
+    bssl::UniquePtr<DH> dh = make_bare_group(getter(nullptr));
+    ASSERT_TRUE(dh);
+    int flags = -1;
+    ASSERT_TRUE(DH_check(dh.get(), &flags));
+    EXPECT_EQ(flags, 0);
+  }
+
+  // All RFC 7919 ffdhe groups. Tested twice: once in their native form (which
+  // carries q = (p-1)/2 and g = 2), and once as a bare (p, g=2) group. Both are
+  // accepted by the fast path with flags == 0.
+  DH *(*const kRFC7919[])(void) = {
+      DH_get_rfc7919_2048, DH_get_rfc7919_3072, DH_get_rfc7919_4096,
+      DH_get_rfc7919_8192,
+  };
+  for (auto getter : kRFC7919) {
+    bssl::UniquePtr<DH> group(getter());
+    ASSERT_TRUE(group);
+    int flags = -1;
+    ASSERT_TRUE(DH_check(group.get(), &flags));
+    EXPECT_EQ(flags, 0);
+
+    bssl::UniquePtr<DH> bare = make_bare_group(BN_dup(DH_get0_p(group.get())));
+    ASSERT_TRUE(bare);
+    flags = -1;
+    ASSERT_TRUE(DH_check(bare.get(), &flags));
+    EXPECT_EQ(flags, 0);
+  }
+
+  // A modulus that is one bit off from a named group must NOT be accepted by
+  // the fast path. DH_check should fall through to full validation and flag it
+  // as composite. This guards against the fast path masking bad parameters.
+  {
+    bssl::UniquePtr<BIGNUM> p(BN_get_rfc3526_prime_2048(nullptr));
+    ASSERT_TRUE(p);
+    // Clear a bit that is set in the real prime so the value stays odd but is
+    // no longer the named prime (and is composite).
+    ASSERT_TRUE(BN_is_bit_set(p.get(), 5));
+    ASSERT_TRUE(BN_clear_bit(p.get(), 5));
+    bssl::UniquePtr<BIGNUM> g(BN_new());
+    ASSERT_TRUE(g);
+    ASSERT_TRUE(BN_set_word(g.get(), 2));
+    bssl::UniquePtr<DH> dh = NewDHGroup(p.get(), /*q=*/nullptr, g.get());
+    ASSERT_TRUE(dh);
+    int flags = -1;
+    ASSERT_TRUE(DH_check(dh.get(), &flags));
+    EXPECT_TRUE(flags & DH_CHECK_P_NOT_PRIME);
+  }
+
+  // A recognized modulus with a q that is NOT the group's subgroup order must
+  // not be waved through by the fast path. Here we perturb ffdhe2048's q so it
+  // no longer equals (p-1)/2; the fast path must decline and full validation
+  // must reject it (q no longer divides p-1 and is composite).
+  {
+    bssl::UniquePtr<DH> group(DH_get_rfc7919_2048());
+    ASSERT_TRUE(group);
+    bssl::UniquePtr<BIGNUM> q(BN_dup(DH_get0_q(group.get())));
+    ASSERT_TRUE(q);
+    ASSERT_TRUE(BN_add_word(q.get(), 2));  // q := (p-1)/2 + 2, no longer valid
+    bssl::UniquePtr<BIGNUM> g(BN_new());
+    ASSERT_TRUE(g);
+    ASSERT_TRUE(BN_set_word(g.get(), 2));
+    bssl::UniquePtr<DH> dh =
+        NewDHGroup(DH_get0_p(group.get()), q.get(), g.get());
+    ASSERT_TRUE(dh);
+    int flags = -1;
+    ASSERT_TRUE(DH_check(dh.get(), &flags));
+    // If the fast path had wrongly accepted this, flags would be 0.
+    EXPECT_TRUE(flags & DH_CHECK_INVALID_Q_VALUE);
+  }
+}
+
+TEST(DHTest, DHMarshalPubKey) {
+  const char* dh512_pem =
+    "-----BEGIN DH PARAMETERS-----\n"
+    "MEYCQQDqvLe5oX3p+Dw8T7NWG7nlWVFK58Ev74xvxYH72DC4kqfPEFPvNnCpFoRB\n"
+    "RdxOz7DZ6JO/GxobSRyAAI766+GDAgEC\n"
+    "-----END DH PARAMETERS-----";
+  const uint64_t encoded_g = 2;
+  const char encoded_p_dec_str[] = "12294183602774786812319504504704470077603616440910559765086569005477513835495488680341310019770549315448633656928525381740662262980129138358936697450520963";
+
+  bssl::UniquePtr<EVP_PKEY> epkey_dh_params(nullptr);
+  {
+    const size_t pem_len = OPENSSL_strnlen(dh512_pem, 1024);
+    bssl::UniquePtr<BIO> in_bio(BIO_new_mem_buf(dh512_pem, pem_len));
+    ASSERT_TRUE(in_bio);
+
+    epkey_dh_params.reset(PEM_read_bio_Parameters(in_bio.get(), nullptr));
+    ASSERT_TRUE(epkey_dh_params);
+  }
+
+  // Sanity check the Param parsing
+  {
+    DH *dh_params = EVP_PKEY_get0_DH(epkey_dh_params.get());
+    ASSERT_TRUE(dh_params);
+    const BIGNUM *p = DH_get0_p(dh_params);
+    const BIGNUM *g = DH_get0_g(dh_params);
+    uint64_t parsed_g = 0;
+    ASSERT_TRUE(BN_get_u64(g, &parsed_g));
+    ASSERT_EQ(parsed_g, encoded_g);
+    const char *parsed_p_dec_str = BN_bn2dec(p);
+    ASSERT_NE(parsed_p_dec_str, nullptr);
+    ASSERT_EQ(OPENSSL_strcasecmp(encoded_p_dec_str, parsed_p_dec_str), 0);
+    OPENSSL_free((void *)parsed_p_dec_str);
+  }
+
+  // Perform keygen operation
+  bssl::UniquePtr<EVP_PKEY> gen_dh(nullptr);
+  {
+    bssl::UniquePtr<EVP_PKEY_CTX> epkey_ctx(
+        EVP_PKEY_CTX_new(epkey_dh_params.get(), nullptr));
+    ASSERT_TRUE(epkey_ctx);
+
+    ASSERT_TRUE(EVP_PKEY_keygen_init(epkey_ctx.get()));
+    EVP_PKEY *gen_dh_raw = nullptr;
+    ASSERT_TRUE(EVP_PKEY_keygen(epkey_ctx.get(), &gen_dh_raw));
+    gen_dh.reset(gen_dh_raw);
+    ASSERT_TRUE(gen_dh);
+  }
+
+  // Marshall pubkey to der
+  const uint8_t* pubkey_der = NULL;
+  size_t pubkey_der_len = 0;
+  {
+    bssl::UniquePtr<BIO> out_bio(BIO_new(BIO_s_mem()));
+    ASSERT_TRUE(out_bio);
+    ASSERT_TRUE(i2d_PUBKEY_bio(out_bio.get(), gen_dh.get()));
+    ASSERT_TRUE(BIO_flush(out_bio.get()));
+    ASSERT_TRUE(BIO_mem_contents(out_bio.get(), &pubkey_der, &pubkey_der_len));
+    ASSERT_GT(pubkey_der_len, (size_t)0);
+    ASSERT_NE(pubkey_der, nullptr);
+    // We own the allocation after this
+    pubkey_der = (const uint8_t*)OPENSSL_memdup(pubkey_der, pubkey_der_len);
+  }
+
+  // Parse der to pubkey
+  bssl::UniquePtr<EVP_PKEY> parsed_der_pubkey(nullptr);
+  {
+    bssl::UniquePtr<BIO> in_bio(BIO_new_mem_buf(pubkey_der, pubkey_der_len));
+    ASSERT_TRUE(in_bio);
+    EVP_PKEY* parsed_dh_pubkey_raw = nullptr;
+    ASSERT_TRUE(d2i_PUBKEY_bio(in_bio.get(), &parsed_dh_pubkey_raw));
+    parsed_der_pubkey.reset(parsed_dh_pubkey_raw);
+    ASSERT_TRUE(parsed_der_pubkey);
+  }
+
+  ASSERT_TRUE(EVP_PKEY_cmp(gen_dh.get(), parsed_der_pubkey.get()));
+
+  // Marshall pubkey to PEM
+  const uint8_t* pubkey_pem = NULL;
+  size_t pubkey_pem_len = 0;
+  {
+    bssl::UniquePtr<BIO> out_bio(BIO_new(BIO_s_mem()));
+    ASSERT_TRUE(out_bio);
+    ASSERT_TRUE(PEM_write_bio_PUBKEY(out_bio.get(), gen_dh.get()));
+    ASSERT_TRUE(BIO_flush(out_bio.get()));
+    ASSERT_TRUE(BIO_mem_contents(out_bio.get(), &pubkey_pem, &pubkey_pem_len));
+    ASSERT_GT(pubkey_pem_len, (size_t)0);
+    ASSERT_TRUE(pubkey_pem);
+    // We own the allocation after this
+    pubkey_pem = (const uint8_t*)OPENSSL_memdup(pubkey_pem, pubkey_pem_len);
+  }
+
+  // Parse PEM to pubkey
+  bssl::UniquePtr<EVP_PKEY> parsed_pem_pubkey(nullptr);
+  {
+    bssl::UniquePtr<BIO> in_bio(BIO_new_mem_buf(pubkey_pem, pubkey_pem_len));
+    ASSERT_TRUE(in_bio);
+    EVP_PKEY* pem_pubkey_raw = NULL;
+    ASSERT_TRUE(PEM_read_bio_PUBKEY(in_bio.get(), &pem_pubkey_raw, NULL, NULL));
+    parsed_pem_pubkey.reset(pem_pubkey_raw);
+    ASSERT_TRUE(parsed_pem_pubkey);
+  }
+
+  ASSERT_TRUE(EVP_PKEY_cmp(gen_dh.get(), parsed_pem_pubkey.get()));
+
+  OPENSSL_free((void*)pubkey_der);
+  OPENSSL_free((void*)pubkey_pem);
+}
+>>>>>>> ac3aee310 (Recognise known safe DH groups/primes and short-circuit Diffie-Hellman test (#3337))
