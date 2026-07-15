@@ -422,6 +422,38 @@ int DH_up_ref(DH *dh) {
   return 1;
 }
 
+// All the groups in RFC 7919 are of the form:
+// q = (p-1)/2
+// g = 2
+DH *dh_calculate_rfc7919_from_p(const BN_ULONG data[], size_t data_len) {
+  BIGNUM *const ffdhe_p = BN_new();
+  BIGNUM *const ffdhe_q = BN_new();
+  BIGNUM *const ffdhe_g = BN_new();
+  DH *const dh = DH_new();
+
+  if (!ffdhe_p || !ffdhe_q || !ffdhe_g || !dh) {
+    goto err;
+  }
+
+  bn_set_static_words(ffdhe_p, data, data_len);
+
+  if (!BN_rshift1(ffdhe_q, ffdhe_p) ||
+      !BN_set_word(ffdhe_g, 2) ||
+      !DH_set0_pqg(dh, ffdhe_p, ffdhe_q, ffdhe_g)) {
+    goto err;
+  }
+
+  return dh;
+
+err:
+  BN_free(ffdhe_p);
+  BN_free(ffdhe_q);
+  BN_free(ffdhe_g);
+  DH_free(dh);
+  return NULL;
+
+}
+
 DH *DH_get_rfc7919_2048(void) {
   // This is the prime from https://tools.ietf.org/html/rfc7919#appendix-A.1,
   // which is specifically approved for FIPS in appendix D of SP 800-56Ar3.
@@ -444,30 +476,6 @@ DH *DH_get_rfc7919_2048(void) {
       TOBN(0xadf85458, 0xa2bb4a9a), TOBN(0xffffffff, 0xffffffff),
   };
 
-  BIGNUM *const ffdhe2048_p = BN_new();
-  BIGNUM *const ffdhe2048_q = BN_new();
-  BIGNUM *const ffdhe2048_g = BN_new();
-  DH *const dh = DH_new();
-
-  if (!ffdhe2048_p || !ffdhe2048_q || !ffdhe2048_g || !dh) {
-    goto err;
-  }
-
-  bn_set_static_words(ffdhe2048_p, kFFDHE2048Data,
-                      OPENSSL_ARRAY_SIZE(kFFDHE2048Data));
-
-  if (!BN_rshift1(ffdhe2048_q, ffdhe2048_p) ||
-      !BN_set_word(ffdhe2048_g, 2) ||
-      !DH_set0_pqg(dh, ffdhe2048_p, ffdhe2048_q, ffdhe2048_g)) {
-    goto err;
-  }
-
-  return dh;
-
- err:
-    BN_free(ffdhe2048_p);
-    BN_free(ffdhe2048_q);
-    BN_free(ffdhe2048_g);
-    DH_free(dh);
-    return NULL;
+  return dh_calculate_rfc7919_from_p(kFFDHE2048Data,
+                                     OPENSSL_ARRAY_SIZE(kFFDHE2048Data));
 }
