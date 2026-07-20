@@ -422,6 +422,38 @@ int DH_up_ref(DH *dh) {
   return 1;
 }
 
+// All the groups in RFC 7919 are of the form:
+// q = (p-1)/2
+// g = 2
+DH *dh_calculate_rfc7919_from_p(const BN_ULONG data[], size_t data_len) {
+  BIGNUM *const ffdhe_p = BN_new();
+  BIGNUM *const ffdhe_q = BN_new();
+  BIGNUM *const ffdhe_g = BN_new();
+  DH *const dh = DH_new();
+
+  if (!ffdhe_p || !ffdhe_q || !ffdhe_g || !dh) {
+    goto err;
+  }
+
+  bn_set_static_words(ffdhe_p, data, data_len);
+
+  if (!BN_rshift1(ffdhe_q, ffdhe_p) ||
+      !BN_set_word(ffdhe_g, 2) ||
+      !DH_set0_pqg(dh, ffdhe_p, ffdhe_q, ffdhe_g)) {
+    goto err;
+  }
+
+  return dh;
+
+err:
+  BN_free(ffdhe_p);
+  BN_free(ffdhe_q);
+  BN_free(ffdhe_g);
+  DH_free(dh);
+  return NULL;
+
+}
+
 DH *DH_get_rfc7919_2048(void) {
   // This is the prime from https://tools.ietf.org/html/rfc7919#appendix-A.1,
   // which is specifically approved for FIPS in appendix D of SP 800-56Ar3.
@@ -435,7 +467,7 @@ DH *DH_get_rfc7919_2048(void) {
       TOBN(0x1d4f42a3, 0xde394df4), TOBN(0xb96adab7, 0x60d7f468),
       TOBN(0xd108a94b, 0xb2c8e3fb), TOBN(0xbc0ab182, 0xb324fb61),
       TOBN(0x30acca4f, 0x483a797a), TOBN(0x1df158a1, 0x36ade735),
-      TOBN(0xe2a689da, 0xf3efe872), TOBN(0x984f0c70, 0xe0e68b77),
+    TOBN(0xe2a689da, 0xf3efe872), TOBN(0x984f0c70, 0xe0e68b77),
       TOBN(0xb557135e, 0x7f57c935), TOBN(0x85636555, 0x3ded1af3),
       TOBN(0x2433f51f, 0x5f066ed0), TOBN(0xd3df1ed5, 0xd5fd6561),
       TOBN(0xf681b202, 0xaec4617a), TOBN(0x7d2fe363, 0x630c75d8),
@@ -444,30 +476,6 @@ DH *DH_get_rfc7919_2048(void) {
       TOBN(0xadf85458, 0xa2bb4a9a), TOBN(0xffffffff, 0xffffffff),
   };
 
-  BIGNUM *const ffdhe2048_p = BN_new();
-  BIGNUM *const ffdhe2048_q = BN_new();
-  BIGNUM *const ffdhe2048_g = BN_new();
-  DH *const dh = DH_new();
-
-  if (!ffdhe2048_p || !ffdhe2048_q || !ffdhe2048_g || !dh) {
-    goto err;
-  }
-
-  bn_set_static_words(ffdhe2048_p, kFFDHE2048Data,
-                      OPENSSL_ARRAY_SIZE(kFFDHE2048Data));
-
-  if (!BN_rshift1(ffdhe2048_q, ffdhe2048_p) ||
-      !BN_set_word(ffdhe2048_g, 2) ||
-      !DH_set0_pqg(dh, ffdhe2048_p, ffdhe2048_q, ffdhe2048_g)) {
-    goto err;
-  }
-
-  return dh;
-
- err:
-    BN_free(ffdhe2048_p);
-    BN_free(ffdhe2048_q);
-    BN_free(ffdhe2048_g);
-    DH_free(dh);
-    return NULL;
+  return dh_calculate_rfc7919_from_p(kFFDHE2048Data,
+                                     OPENSSL_ARRAY_SIZE(kFFDHE2048Data));
 }
