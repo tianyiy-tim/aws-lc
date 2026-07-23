@@ -1,6 +1,10 @@
 """
 Verdict computation.
 
+Layer: analysis. Builds on ``engine`` + ``ai`` + ``gitutil``; the shared
+classification step every command (``analyze`` / ``apply`` / ``ci`` / ``resolve``)
+runs to turn a fix into per-branch verdicts.
+
 The deterministic classifier (:func:`bucket_branches`) sorts every branch into
 AFFECTED / NOT_AFFECTED / UNSURE / ALREADY using ancestry, patch-id, and the
 vulnerable pre-image. Then the advisory AI passes (:func:`resolve_inconclusive`)
@@ -44,7 +48,7 @@ def bucket_branches(
     # file must never make a branch affected (its presence, or a stale line in it,
     # is not the vulnerable code). Fall back to all files only if the fix is
     # test/generated-only.
-    src_files = [f for f in files if not bot._is_test_or_generated_file(f)] or files
+    src_files = [f for f in files if not bot.is_test_or_generated_file(f)] or files
 
     buckets: Dict[str, str] = {}
     for branch in branches:
@@ -74,7 +78,7 @@ def bucket_branches(
         # Not confidently affected. Decide UNSURE vs a confident NOT AFFECTED,
         # biasing hard toward UNSURE so a miss is never silent.
         present = any(
-            bot._get_file_on_branch(f, ref, commit=fix_sha)[0] is not None
+            bot.get_file_on_branch(f, ref, commit=fix_sha)[0] is not None
             for f in src_files
         )
         if not present:
@@ -152,14 +156,14 @@ def resolve_unsure(
 # --------------------------------------------------------------------------
 
 
-def _commit_time(sha: str) -> int:
+def commit_time(sha: str) -> int:
     """Unix commit timestamp of *sha* (0 if it can't be resolved). Used to pick
     the newest introducer."""
     out = git("show", "-s", "--format=%ct", sha, check=False).stdout.strip()
     return int(out) if out.isdigit() else 0
 
 
-def _suspect_affected_branches(
+def suspect_affected_branches(
     introducers: Sequence[str], buckets: Dict[str, str]
 ) -> "Dict[str, Tuple[int, int]]":
     """AFFECTED branches that look like over-flags worth a second opinion.
@@ -181,7 +185,7 @@ def _suspect_affected_branches(
         # A single introducer that reaches the branch is an unambiguous hit;
         # there is no old-vs-new lineage split to be suspicious about.
         return suspects
-    newest = max(intro, key=_commit_time)
+    newest = max(intro, key=commit_time)
     intro_set = set(intro)
     for branch, state in buckets.items():
         if state != AFFECTED:
@@ -202,7 +206,7 @@ def review_suspect_affected(
     use_ai: bool = True,
 ) -> None:
     """Attach a false-positive review note to over-flag-candidate AFFECTED
-    branches (those from :func:`_suspect_affected_branches`), consulting the AI
+    branches (those from :func:`suspect_affected_branches`), consulting the AI
     advisory when *use_ai*.
 
     CRITICAL: this is advisory only and NEVER changes the verdict. The branch
@@ -256,7 +260,7 @@ def resolve_inconclusive(args, fix_sha, files, introducers, buckets):
     # are likely over-flags (old shared code present, newer vulnerable commit
     # absent). Flag them for review -- consulting AI when enabled -- but never
     # change the verdict, so this can only reduce noise, never cause a miss.
-    suspects = _suspect_affected_branches(introducers, buckets)
+    suspects = suspect_affected_branches(introducers, buckets)
     if suspects:
         if use_ai and not args.json:
             print(

@@ -1,6 +1,9 @@
 """
 Shared vocabulary for the backport CLI.
 
+Layer: foundation (leaf). Imported by every other module; depends on nothing
+internal, so it can never be part of an import cycle.
+
 This is the leaf module every other one can import without risking a cycle: the
 four verdict states, their display labels, and the single user-facing error type.
 """

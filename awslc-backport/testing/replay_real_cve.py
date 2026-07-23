@@ -14,7 +14,7 @@ release branch this harness:
   2. Rolls the repo back to the state right before that hand-made backport landed
      (for affected branches, the branch is reset to the backport commit's parent),
      so the fix is genuinely absent again and the tool has to rediscover the need.
-  3. Runs the REAL deterministic engine from backport_bot.py against that rolled-back
+  3. Runs the REAL deterministic engine (src/engine.py) against that rolled-back
      world (get_changed_files -> find_introducing_commit -> is_branch_affected ->
      is_already_patched, and optionally a cherry-pick apply).
   4. Compares the tool's per-branch verdict to the ground truth and scores it
@@ -29,27 +29,29 @@ only ever read.
 
 USAGE
 -----
-    # Run the built-in set of real, verified multi-branch examples:
-    python3 scripts/replay_real_cve.py
+    # (run from the awslc-backport dir). The curated bench, scored vs the key:
+    python3 testing/replay_real_cve.py --file testing/reliable_cves.txt \
+        --answers testing/answer_key.txt
 
     # Replay specific fix commits (SHAs or refs on mainline):
-    python3 scripts/replay_real_cve.py 9545d9de6059 110f184623b5
+    python3 testing/replay_real_cve.py 9545d9de6059 110f184623b5
 
     # Replay by PR / merge number (resolved from mainline commit subjects):
-    python3 scripts/replay_real_cve.py 1109 '#1917'
+    python3 testing/replay_real_cve.py 1109 '#1917'
 
-    # Replay a whole list of fixes from a file (one commit/PR-number per line):
-    python3 scripts/replay_real_cve.py --file cves_to_test.txt
+    # AI is ON by default (mirrors how the bot runs). Add --no-ai for an
+    # offline / no-creds deterministic-only sweep (ground truth is unchanged):
+    python3 testing/replay_real_cve.py --file testing/reliable_cves.txt --no-ai
 
     # Also attempt the cherry-pick apply (slower: checks out each branch):
-    python3 scripts/replay_real_cve.py --cherry-pick
+    python3 testing/replay_real_cve.py --cherry-pick
 
     # Point at a different clone, or limit branches:
-    python3 scripts/replay_real_cve.py --repo /path/to/aws-lc \
+    python3 testing/replay_real_cve.py --repo /path/to/aws-lc \
         --branches fips-2024-09-27 fips-2025-09-12-lts
 
     # Override the discovered ground truth (comma-separated affected branches):
-    python3 scripts/replay_real_cve.py 9545d9de6059 --truth fips-2022-11-02,fips-2021-10-20
+    python3 testing/replay_real_cve.py 9545d9de6059 --truth fips-2022-11-02,fips-2021-10-20
 
 Set KEEP_SANDBOX=1 to leave the throwaway repos on disk for inspection.
 """
@@ -70,11 +72,11 @@ from pathlib import Path
 
 # The engine lives in the src/ folder one directory up; import from there.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from ai import _ai_client  # noqa: E402
+from ai import ai_client  # noqa: E402
 from engine import (  # noqa: E402
-    _is_test_or_generated_file,
-    _parse_eos_date,
-    _patch_id_pathspec,
+    is_test_or_generated_file,
+    parse_eos_date,
+    patch_id_pathspec,
     find_introducing_commit,
     get_changed_files,
     is_already_patched,
@@ -130,11 +132,11 @@ _BACKPORT_KW = re.compile(r"cherry.?pick|backport", re.I)
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
 
 
-def _extract_cves(text):
+def extract_cves(text):
     return {m.upper() for m in _CVE_RE.findall(text or "")}
 
 
-def _norm_subject(s):
+def norm_subject(s):
     """Normalize a commit subject for backport matching: drop the trailing PR
     number "(#NNNN)" and lowercase. AWS-LC backport PRs typically reuse the exact
     mainline title with only a new PR number, so the normalized subjects match."""
@@ -171,7 +173,7 @@ def subject(repo, sha):
     return git(repo, "log", "-1", "--format=%s", sha, check=False).stdout.strip()
 
 
-def _resolve_pr_number(repo, n, mainline="origin/main"):
+def resolve_pr_number(repo, n, mainline="origin/main"):
     """
     Resolve a PR/merge number to the mainline commit that carried it, by searching
     commit subjects. AWS-LC squash-merges with the number appended as "(#N)";
@@ -223,11 +225,11 @@ def resolve_ref(repo, token):
     """
     Resolve a user-supplied token to a mainline commit SHA. Accepts either a git
     SHA/ref, or a PR/merge number like '1109' or '#1109' (resolved by searching
-    mainline commit subjects; see _resolve_pr_number).
+    mainline commit subjects; see resolve_pr_number).
     """
     stripped = token.lstrip("#").strip()
     if stripped.isdigit():
-        return _resolve_pr_number(repo, stripped)
+        return resolve_pr_number(repo, stripped)
     return rev_parse(repo, token)
 
 
@@ -296,7 +298,7 @@ def filter_by_support_window(manifest, branches, as_of):
         if not e.get("actively_maintained", True):
             dropped.append((b, "not actively maintained"))
             continue
-        eos = _parse_eos_date(e.get("end_of_support"))
+        eos = parse_eos_date(e.get("end_of_support"))
         if eos is not None and eos < as_of:
             dropped.append((b, f"end of support {e.get('end_of_support')} < fix date"))
             continue
@@ -319,7 +321,7 @@ def chdir(path):
 # ---------------------------------------------------------------------------
 
 
-def _patch_id_map(repo, rev_range):
+def patch_id_map(repo, rev_range):
     """Return {patch_id: commit_sha} for the commits in rev_range (read as bytes).
 
     Patch-ids exclude auto-generated/derived files (same pathspec the bot uses),
@@ -334,7 +336,7 @@ def _patch_id_map(repo, rev_range):
             "--no-merges",
             "--format=%H",
             rev_range,
-            *_patch_id_pathspec(),
+            *patch_id_pathspec(),
         ],
         cwd=repo,
         capture_output=True,
@@ -361,20 +363,20 @@ def discover_ground_truth(repo, fix_sha, branches, label=None):
 
     Returns {branch: {"affected": bool, "backport": sha|None, "via": str}}.
     """
-    fix_pid_map = _patch_id_map(repo, f"{fix_sha}^..{fix_sha}")
+    fix_pid_map = patch_id_map(repo, f"{fix_sha}^..{fix_sha}")
     fix_pid = next(iter(fix_pid_map), None)  # patch-id of the fix itself
     fix_short = fix_sha[:12]
 
     # CVE ids the fix addresses, taken from the commit message AND the test-file
     # label (many mainline commits don't name the CVE, but the list entry does).
     fix_msg = git(repo, "log", "-1", "--format=%B", fix_sha, check=False).stdout
-    cve_ids = _extract_cves(fix_msg) | _extract_cves(label)
+    cve_ids = extract_cves(fix_msg) | extract_cves(label)
 
     # PR number(s) from the fix SUBJECT only (the trailing "(#NNNN)"). Used to link
     # a mainline fix to a separate-PR hand-backport that cites it (Signal 1b).
     fix_subject = git(repo, "log", "-1", "--format=%s", fix_sha, check=False).stdout
     fix_prs = set(_PR_RE.findall(fix_subject))
-    fix_title = _norm_subject(fix_subject)
+    fix_title = norm_subject(fix_subject)
 
     # Changed source files, used by the pre-image presence check (Signal 4). Its
     # git queries are cwd-relative, so run them in the target repo.
@@ -422,7 +424,7 @@ def discover_ground_truth(repo, fix_sha, branches, label=None):
 
         # Signal 2: a divergent commit with the same patch-id as the fix.
         if fix_pid:
-            branch_pids = _patch_id_map(repo, rng)
+            branch_pids = patch_id_map(repo, rng)
             if fix_pid in branch_pids:
                 if backport is None:
                     backport = branch_pids[fix_pid]
@@ -454,7 +456,7 @@ def discover_ground_truth(repo, fix_sha, branches, label=None):
         # it). This is a real backport and a clean rollback point.
         if backport is None and fix_title:
             for h, text in entries:
-                if _norm_subject(text.split("\n", 1)[0]) == fix_title:
+                if norm_subject(text.split("\n", 1)[0]) == fix_title:
                     backport = h
                     if "same-title" not in via:
                         via.append("same-title")
@@ -469,7 +471,7 @@ def discover_ground_truth(repo, fix_sha, branches, label=None):
         cve_hit = False
         if cve_ids and backport is None:
             for _h, text in entries:
-                if _extract_cves(text) & cve_ids:
+                if extract_cves(text) & cve_ids:
                     cve_hit = True
                     break
         if cve_hit:
@@ -572,7 +574,7 @@ def simulate_cherry_pick(sandbox, commit, branch):
             xy, path = line[:2], line[3:].strip()
             if "U" in xy or xy in ("AA", "DD"):
                 unmerged.append(path)
-        if unmerged and all(_is_test_or_generated_file(p) for p in unmerged):
+        if unmerged and all(is_test_or_generated_file(p) for p in unmerged):
             return "test-only"
         return "conflict"
     finally:
@@ -1061,9 +1063,9 @@ def main():
     print("(no pushes, no gh, no mutation of the real repo; throwaway sandbox only)")
     if with_ai:
         # We never want to *think* AI ran when it silently didn't. If the SDK or
-        # credentials aren't available, _ai_client() returns None and the engine
+        # credentials aren't available, ai_client() returns None and the engine
         # falls back to deterministic-only — so say so, loudly, up front.
-        if _ai_client() is None:
+        if ai_client() is None:
             print(
                 "\n[WARN] AI is ON but the Bedrock client could not initialize "
                 "(missing anthropic SDK or AWS creds). This run would fall back to "
@@ -1098,7 +1100,7 @@ def main():
             answers[parts[0]] = parts[1].strip() if len(parts) > 1 else ""
         print(f"answer key: {args.answers} ({len(answers)} fixes)")
 
-    def _truth_for(ref):
+    def truth_for(ref):
         if answers:
             # match by the raw ref or its resolved short/long sha
             if ref in answers:
@@ -1121,7 +1123,7 @@ def main():
             "branches": args.branches,
             "cherry_pick": args.cherry_pick,
             "with_ai": with_ai,
-            "truth": _truth_for(ref),
+            "truth": truth_for(ref),
             "manifest": manifest,
             "keep": keep,
             "jobs": args.jobs,

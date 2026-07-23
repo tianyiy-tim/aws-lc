@@ -1,6 +1,10 @@
 """
 Backport engine: the deterministic core.
 
+Layer: impact core. Builds on ``settings``; the deterministic brain that
+``gitutil``, ``ai``, ``verdicts`` and every command build on. Has no CLI or I/O
+of its own.
+
 Branch resolution, git/text helpers, impact analysis (is_branch_affected),
 already-patched detection, and the vulnerable-pre-image check. The advisory AI
 layer is in ai.py; the pre-merge CLI (analyze/apply/ci) is split across main.py
@@ -9,7 +13,7 @@ and its helper modules. Every git command runs against the configured REPO_PATH
 without chdir.
 
 Sections, top to bottom:
-  1. Repository targeting          set_repo_path / _run / _git
+  1. Repository targeting          set_repo_path / run / git
   2. Caches, constants & config    tunable knobs and per-process caches
   3. Supported-branch resolution   which release branches to consider
   4. Text / line normalizers       comment- and whitespace-aware helpers
@@ -45,16 +49,16 @@ def set_repo_path(path):
     REPO_PATH = os.path.abspath(path) if path else None
 
 
-def _run(cmd, **kwargs):
+def run(cmd, **kwargs):
     """Run a command against REPO_PATH (unless an explicit cwd is given)."""
     if REPO_PATH is not None and kwargs.get("cwd") is None:
         kwargs["cwd"] = REPO_PATH
     return subprocess.run(list(cmd), **kwargs)
 
 
-def _git(args, **kwargs):
+def git(args, **kwargs):
     """Run a git subcommand against REPO_PATH."""
-    return _run(["git", *args], **kwargs)
+    return run(["git", *args], **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +88,7 @@ _GENERATED_PATHSPECS = [
 ]
 
 
-def _patch_id_pathspec():
+def patch_id_pathspec():
     """Git pathspec keeping every file except the generated ones, so a patch-id
     reflects only human-authored source. Returns [] when nothing is excluded."""
     if not _GENERATED_PATHSPECS:
@@ -119,7 +123,7 @@ VERSIONS_MANIFEST_PATH = os.environ.get(
 # ---------------------------------------------------------------------------
 
 
-def _remote_branch_names():
+def remote_branch_names():
     """Branch names (without the `origin/` prefix) from `git branch -r`,
     skipping the symbolic `origin/HEAD -> origin/main` ref."""
     result = subprocess.run(["git", "branch", "-r"], capture_output=True, text=True)
@@ -171,7 +175,7 @@ def load_versions_manifest():
         return None
 
 
-def _parse_eos_date(value):
+def parse_eos_date(value):
     """Parse an end-of-support date (`YYYY-MM-DD` or `YYYY-MM`). Returns None if
     missing/unparseable, which callers treat as "no known EOS" (still supported)."""
     for fmt in ("%Y-%m-%d", "%Y-%m"):
@@ -196,13 +200,13 @@ def branch_support_status(today=None):
     if not manifest:
         return []
     today = today or date.today()
-    remote = set(_remote_branch_names())
+    remote = set(remote_branch_names())
     records = []
     for entry in manifest.get("fips_branches", []):
         name = entry.get("branch")
         if not name:
             continue
-        eos = _parse_eos_date(entry.get("end_of_support"))
+        eos = parse_eos_date(entry.get("end_of_support"))
         within_window = eos is None or eos >= today
         maintained = entry.get("actively_maintained", True)
         record = dict(entry)
@@ -213,7 +217,7 @@ def branch_support_status(today=None):
     return records
 
 
-def _branch_date_key(name):
+def branch_date_key(name):
     """The YYYY-MM-DD embedded in *name*, or '' if none. Used to order branches."""
     m = re.search(r"\d{4}-\d{2}-\d{2}", name)
     return m.group(0) if m else ""
@@ -224,7 +228,7 @@ def sort_branches(names):
     The single source of truth for branch ordering, so every listing matches."""
     return sorted(
         names,
-        key=lambda n: (_branch_date_key(n) or "0000-00-00", n),
+        key=lambda n: (branch_date_key(n) or "0000-00-00", n),
         reverse=True,
     )
 
@@ -246,7 +250,7 @@ def get_supported_branches(today=None):
     else:
         supported = [
             name
-            for name in _remote_branch_names()
+            for name in remote_branch_names()
             if f"origin/{name}".startswith(SUPPORTED_BRANCH_PREFIXES)
         ]
     return sort_branches(supported)
@@ -278,7 +282,7 @@ def get_changed_files(commit):
 # ---------------------------------------------------------------------------
 
 
-def _norm_ws(s):
+def norm_ws(s):
     """Collapse runs of whitespace so a reformatted line still matches."""
     return re.sub(r"\s+", " ", s).strip()
 
@@ -286,13 +290,13 @@ def _norm_ws(s):
 _C_FAMILY_EXT = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx")
 
 
-def _is_c_file(file):
+def is_c_file(file):
     """True for C/C++ source/headers, where '#' is a preprocessor directive
     (real code), not a comment."""
     return file is not None and file.lower().endswith(_C_FAMILY_EXT)
 
 
-def _is_noise_line(s, file=None):
+def is_noise_line(s, file=None):
     """True for lines with no vulnerable-code signal: comments, blanks, pure
     punctuation/braces. '#' is a comment only in non-C files; in C/C++ it is a
     preprocessor directive (real code) and is kept."""
@@ -301,14 +305,14 @@ def _is_noise_line(s, file=None):
         return True
     if s.startswith(("//", "/*", "*/", "*")):  # C/C++ comments
         return True
-    if s.startswith("#") and not _is_c_file(file):  # script/config comment
+    if s.startswith("#") and not is_c_file(file):  # script/config comment
         return True
     if set(s) <= set("{}();,: \t"):  # punctuation only
         return True
     return False
 
 
-def _is_boilerplate_line(s):
+def is_boilerplate_line(s):
     """True for real-but-undistinctive lines (bare control-flow, #include, a lone
     string literal) that match too many files to be a reliable pre-image. Skipping
     them only weakens a match, so it is false-negative safe."""
@@ -330,7 +334,7 @@ def _is_boilerplate_line(s):
 # ---------------------------------------------------------------------------
 
 
-def _fix_removed_lines(commit, file):
+def fix_removed_lines(commit, file):
     """The distinctive lines the fix removes/changes for *file* (the vulnerable
     pre-image), skipping comments, blanks, punctuation, and boilerplate."""
     cache_key = (commit, file)
@@ -348,9 +352,9 @@ def _fix_removed_lines(commit, file):
     for line in diff.stdout.splitlines():
         if line.startswith("-") and not line.startswith("---"):
             s = line[1:].strip()
-            if _is_noise_line(s, file):
+            if is_noise_line(s, file):
                 continue
-            if _is_boilerplate_line(s):
+            if is_boilerplate_line(s):
                 continue
             if len(re.sub(r"\W", "", s)) >= 6:  # enough alnum to be distinctive
                 removed.append(s)
@@ -367,12 +371,12 @@ def vulnerable_preimage_present(commit, changed_files, ref):
     cache_key = (commit, tuple(changed_files), ref)
     if cache_key in _PREIMAGE_CACHE:
         return _PREIMAGE_CACHE[cache_key]
-    result = _vulnerable_preimage_present_uncached(commit, changed_files, ref)
+    result = vulnerable_preimage_present_uncached(commit, changed_files, ref)
     _PREIMAGE_CACHE[cache_key] = result
     return result
 
 
-def _is_test_or_generated_file(f):
+def is_test_or_generated_file(f):
     """True for test or auto-generated files. Their content is not the shipped
     vulnerable source, so a pre-image match there is not evidence of impact."""
     if any(f == p or f.startswith(p.rstrip("/") + "/") for p in _GENERATED_PATHSPECS):
@@ -387,14 +391,14 @@ def _is_test_or_generated_file(f):
     )
 
 
-def _vulnerable_preimage_present_uncached(commit, changed_files, ref):
+def vulnerable_preimage_present_uncached(commit, changed_files, ref):
     saw_removed = False
     for file in changed_files:
         # Skip test/generated files: a match there isn't the shipped vulnerable
         # code, and counting it produced false 'still present' (affected) results.
-        if _is_test_or_generated_file(file):
+        if is_test_or_generated_file(file):
             continue
-        removed = _fix_removed_lines(commit, file)
+        removed = fix_removed_lines(commit, file)
         if not removed:
             continue
         saw_removed = True
@@ -403,9 +407,9 @@ def _vulnerable_preimage_present_uncached(commit, changed_files, ref):
         )
         if show.returncode != 0:
             continue
-        content = _norm_ws(show.stdout)
+        content = norm_ws(show.stdout)
         for rl in removed:
-            if _norm_ws(rl) in content:
+            if norm_ws(rl) in content:
                 return True
     if not saw_removed:
         return None
@@ -417,7 +421,7 @@ def _vulnerable_preimage_present_uncached(commit, changed_files, ref):
 # ---------------------------------------------------------------------------
 
 
-def _get_commit_diff(commit):
+def get_commit_diff(commit):
     """Return the full diff for *commit* as a string (capped at _AI_MAX_DIFF_BYTES)."""
     result = subprocess.run(
         ["git", "show", "--stat", "-p", commit],
@@ -430,7 +434,7 @@ def _get_commit_diff(commit):
     return result.stdout[:_AI_MAX_DIFF_BYTES]
 
 
-def _show_file(ref, path):
+def show_file(ref, path):
     """Raw contents of *path* at *ref*, or None if it doesn't exist there."""
     result = subprocess.run(
         ["git", "show", f"{ref}:{path}"],
@@ -443,7 +447,7 @@ def _show_file(ref, path):
     return result.stdout
 
 
-def _historical_paths(commit, file_path, limit=6):
+def historical_paths(commit, file_path, limit=6):
     """Paths *file_path* has occupied over its history (current first, then older
     names, following renames) as of *commit* -- so we can find the file on a
     branch that forked before a rename."""
@@ -478,18 +482,18 @@ def _historical_paths(commit, file_path, limit=6):
     return paths
 
 
-def _get_file_on_branch(file_path, branch_ref, commit=None):
+def get_file_on_branch(file_path, branch_ref, commit=None):
     """(content, resolved_path) for *file_path* on *branch_ref*, capped at
     _AI_MAX_FILE_BYTES. If absent at the current path and *commit* is given,
     follows rename history to try earlier paths. (None, None) if not found."""
-    content = _show_file(branch_ref, file_path)
+    content = show_file(branch_ref, file_path)
     if content is not None:
         return content[:_AI_MAX_FILE_BYTES], file_path
     if commit:
-        for older in _historical_paths(commit, file_path):
+        for older in historical_paths(commit, file_path):
             if older == file_path:
                 continue
-            content = _show_file(branch_ref, older)
+            content = show_file(branch_ref, older)
             if content is not None:
                 return content[:_AI_MAX_FILE_BYTES], older
     return None, None
@@ -511,7 +515,7 @@ def find_introducing_commit(commit, files):
     for file in files:
         # Test/generated files aren't the vulnerable source, and their introducer
         # would over-flag branches that lack the fixed module.
-        if _is_test_or_generated_file(file):
+        if is_test_or_generated_file(file):
             continue
         result = subprocess.run(
             ["git", "diff", "-U0", f"{commit}^", commit, "--", file],
@@ -544,7 +548,7 @@ def find_introducing_commit(commit, files):
                 cur["changed"].append(line[1:])
 
         for h in hunks:
-            if h["changed"] and all(_is_noise_line(c, file) for c in h["changed"]):
+            if h["changed"] and all(is_noise_line(c, file) for c in h["changed"]):
                 continue  # comment/blank/punctuation-only change: not impact-relevant
             old_start, old_count = h["start"], h["count"]
             if old_count == 0:
@@ -556,14 +560,14 @@ def find_introducing_commit(commit, files):
                 blame_start = old_start
                 blame_end = old_start + old_count - 1
 
-            origin_sha = _find_line_origin(file, blame_start, blame_end, f"{commit}^")
+            origin_sha = find_line_origin(file, blame_start, blame_end, f"{commit}^")
             if origin_sha:
                 introducing.add(origin_sha)
 
     return introducing
 
 
-def _find_line_origin(file, line_start, line_end, ref):
+def find_line_origin(file, line_start, line_end, ref):
     """SHA of the oldest commit to touch lines [line_start, line_end] of *file* as
     of *ref* (via `git log -L --reverse`), falling back to `git blame -w -M -C`."""
     log_result = subprocess.run(
@@ -625,7 +629,7 @@ def _find_line_origin(file, line_start, line_end, ref):
 # ---------------------------------------------------------------------------
 
 
-def _introducer_reaches(introducing_commits, ref):
+def introducer_reaches(introducing_commits, ref):
     """True if any introducer reaches *ref* by SHA ancestry (Path 1) or patch-id
     equivalence (Path 2 -- a cherry-pick that got a new SHA)."""
     for sha in introducing_commits:
@@ -641,30 +645,28 @@ def _introducer_reaches(introducing_commits, ref):
                 f"git merge-base failed (code {r.returncode}) checking {sha} "
                 f"against {ref}: {r.stderr}"
             )
-    branch_pids = _get_branch_patch_ids(ref)
+    branch_pids = get_branch_patch_ids(ref)
     for sha in introducing_commits:
-        pid = _patch_id_of(sha)
+        pid = patch_id_of(sha)
         if pid and pid in branch_pids:
             return True
     return False
 
 
-def _source_files_present(changed_files, ref, commit):
+def source_files_present(changed_files, ref, commit):
     """True if any non-test/-generated changed file exists on *ref* (rename-aware)."""
     source = [
-        f for f in changed_files if not _is_test_or_generated_file(f)
+        f for f in changed_files if not is_test_or_generated_file(f)
     ] or changed_files
-    return any(
-        _get_file_on_branch(f, ref, commit=commit)[0] is not None for f in source
-    )
+    return any(get_file_on_branch(f, ref, commit=commit)[0] is not None for f in source)
 
 
-def _deterministic_impact(introducing_commits, ref, commit, changed_files):
+def deterministic_impact(introducing_commits, ref, commit, changed_files):
     """Deterministic verdict before the AI layer: 'affected', 'not_affected', or
     'inconclusive'. Implements Paths 1/2 (ancestry, patch-id), 2b (positive
     pre-image), 3 (file absence), and 4 (pre-image downgrade)."""
     has_context = bool(commit and changed_files)
-    affected = _introducer_reaches(introducing_commits, ref)
+    affected = introducer_reaches(introducing_commits, ref)
     # Path 2b: a branch-specific introducer that Paths 1/2 miss, caught by the
     # exact removed lines still being present.
     if not affected and has_context:
@@ -683,12 +685,12 @@ def _deterministic_impact(introducing_commits, ref, commit, changed_files):
         return "affected"
 
     # Path 3: none of the fixed source files exist here -> confident not-affected.
-    if changed_files and not _source_files_present(changed_files, ref, commit):
+    if changed_files and not source_files_present(changed_files, ref, commit):
         return "not_affected"
     return "inconclusive"
 
 
-def _run_ai_advisory(commit, branch, changed_files, introducing_commits, det_affected):
+def run_ai_advisory(commit, branch, changed_files, introducing_commits, det_affected):
     """Call the advisory AI in the role implied by the deterministic verdict, tag
     the result, and log it. Returns the advisory dict or None."""
     from ai import ai_impact_analysis  # local import avoids an ai<->engine cycle
@@ -713,7 +715,7 @@ def _run_ai_advisory(commit, branch, changed_files, introducing_commits, det_aff
     return advisory
 
 
-def _fold_advisory(det_affected, advisory, commit, changed_files, ref):
+def fold_advisory(det_affected, advisory, commit, changed_files, ref):
     """Combine the deterministic verdict with the advisory, gated by direction so
     the AI never acts alone:
       tie-breaker (inconclusive -> affected): safe, only ADDS a backport;
@@ -741,7 +743,7 @@ def _fold_advisory(det_affected, advisory, commit, changed_files, ref):
     # Inconclusive: a "likely affected" upgrades only if a fixed file is actually
     # here at its exact path (else a backport would be an impossible cherry-pick).
     if likely is True:
-        if _any_changed_file_present_exact(changed_files, ref):
+        if any_changed_file_present_exact(changed_files, ref):
             advisory["overrode_deterministic"] = True
             return True
         advisory["tiebreaker_blocked_no_file"] = True
@@ -753,14 +755,14 @@ def is_branch_affected(
 ) -> "tuple[bool, dict | None]":
     """Is *branch* affected by the fix? Returns (affected, ai_advisory).
 
-    The deterministic engine (see _deterministic_impact) owns the verdict; the AI
-    layer only nudges it under strict gating (see _fold_advisory). Called with
+    The deterministic engine (see deterministic_impact) owns the verdict; the AI
+    layer only nudges it under strict gating (see fold_advisory). Called with
     just (introducers, branch) it is a pure ancestry + patch-id check; called with
     commit + changed_files it also runs the pre-image paths and the AI layer.
     See CLAUDE.md for the full rationale behind each path.
     """
     ref = f"origin/{branch}"
-    verdict = _deterministic_impact(introducing_commits, ref, commit, changed_files)
+    verdict = deterministic_impact(introducing_commits, ref, commit, changed_files)
     if verdict == "not_affected":
         return False, None
     det_affected = verdict == "affected"
@@ -771,13 +773,13 @@ def is_branch_affected(
 
     # Inconclusive AND the code isn't on this branch at all -> confident
     # not-affected; an AI call here could only guess.
-    if not det_affected and not _any_changed_file_present_exact(changed_files, ref):
+    if not det_affected and not any_changed_file_present_exact(changed_files, ref):
         return False, None
 
-    advisory = _run_ai_advisory(
+    advisory = run_ai_advisory(
         commit, branch, changed_files, introducing_commits, det_affected
     )
-    return _fold_advisory(det_affected, advisory, commit, changed_files, ref), advisory
+    return fold_advisory(det_affected, advisory, commit, changed_files, ref), advisory
 
 
 def present_introducers(introducing_commits, branch):
@@ -796,19 +798,19 @@ def present_introducers(introducing_commits, branch):
             present.add(sha)
     remaining = set(introducing_commits) - present
     if remaining:
-        branch_pids = _get_branch_patch_ids(ref)
+        branch_pids = get_branch_patch_ids(ref)
         for sha in remaining:
-            pid = _patch_id_of(sha)
+            pid = patch_id_of(sha)
             if pid and pid in branch_pids:
                 present.add(sha)
     return present
 
 
-def _any_changed_file_present_exact(changed_files, ref):
+def any_changed_file_present_exact(changed_files, ref):
     """True if any changed source file exists on *ref* at its EXACT path. Used to
     stop the tie-breaker upgrading a branch where the fix's code isn't present
     (rename-aware matching could falsely link unrelated same-named files)."""
-    source = [f for f in (changed_files or ()) if not _is_test_or_generated_file(f)]
+    source = [f for f in (changed_files or ()) if not is_test_or_generated_file(f)]
     for f in source or (changed_files or ()):
         r = subprocess.run(["git", "cat-file", "-e", f"{ref}:{f}"], capture_output=True)
         if r.returncode == 0:
@@ -821,7 +823,7 @@ def _any_changed_file_present_exact(changed_files, ref):
 # ---------------------------------------------------------------------------
 
 
-def _branch_cites_cherry_pick(commit, ref):
+def branch_cites_cherry_pick(commit, ref):
     """True if a divergent commit on *ref* records `cherry picked from commit
     <full-sha>` for *commit*. Catches bundled/reshaped -x backports whose patch-id
     differs; the exact-SHA match means it never false-negatives. Mainline ref via
@@ -846,7 +848,7 @@ def _branch_cites_cherry_pick(commit, ref):
     return f"cherry picked from commit {full_sha}" in log.stdout
 
 
-def _get_branch_patch_ids(ref):
+def get_branch_patch_ids(ref):
     """Patch-ids of the branch's DIVERGENT commits (on *ref* but not mainline),
     where cherry-picked backports live. Output read as bytes to tolerate binary
     diffs. Mainline ref via BACKPORT_MAINLINE_REF (default origin/main)."""
@@ -860,7 +862,7 @@ def _get_branch_patch_ids(ref):
             "--no-merges",
             "--format=%H",
             rev_range,
-            *_patch_id_pathspec(),
+            *patch_id_pathspec(),
         ],
         capture_output=True,  # bytes, not text: diffs may contain binary content
     )
@@ -893,21 +895,21 @@ def is_already_patched(commit, branch):
 
     # A `-x` annotation proves a cherry-pick even when a reshaped/bundled backport
     # has a different patch-id.
-    if _branch_cites_cherry_pick(commit, ref):
+    if branch_cites_cherry_pick(commit, ref):
         return True
 
-    target_pid = _patch_id_of(commit)
+    target_pid = patch_id_of(commit)
     if not target_pid:
         return False
 
-    branch_pids = _get_branch_patch_ids(ref)
+    branch_pids = get_branch_patch_ids(ref)
     return target_pid in branch_pids
 
 
-def _patch_id_of(commit):
+def patch_id_of(commit):
     """Return the patch-id (content hash) of a single commit, or None on failure."""
     show = subprocess.run(
-        ["git", "show", commit, *_patch_id_pathspec()],
+        ["git", "show", commit, *patch_id_pathspec()],
         capture_output=True,  # bytes: the commit may touch binary files
     )
     if show.returncode != 0:

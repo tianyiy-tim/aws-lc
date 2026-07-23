@@ -1,6 +1,9 @@
 """
 Central AI / model configuration.
 
+Layer: foundation (leaf). Depends only on the standard library; consumed by
+``engine.py`` and ``ai.py``.
+
 All model pins and Bedrock call knobs live in one place -- ``model-config.json``
 at the tool root -- instead of being scattered across the engine and AI modules.
 Precedence for each value: environment variable > ``model-config.json`` >
@@ -28,7 +31,7 @@ _DEFAULTS = {
 _SETTINGS_PATH = Path(__file__).resolve().parent.parent / "model-config.json"
 
 
-def _load() -> dict:
+def load() -> dict:
     cfg = dict(_DEFAULTS)
     try:
         loaded = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -38,7 +41,7 @@ def _load() -> dict:
     return cfg
 
 
-_CFG = _load()
+_CFG = load()
 
 # Environment overrides win, then the file, then the default.
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", _CFG["model_id"])

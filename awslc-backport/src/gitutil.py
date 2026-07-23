@@ -1,7 +1,10 @@
 """
 Git plumbing and repository targeting.
 
-Everything that shells out to git lives here: the low-level ``_run``/``git``
+Layer: git plumbing. Builds on ``engine`` (for REPO_PATH) + ``common``; used by
+``patches``, ``verdicts`` and the command modules.
+
+Everything that shells out to git lives here: the low-level ``run``/``git``
 wrappers, throwaway worktrees, the cherry-pick primitive shared by ``apply`` and
 ``ci``, the two ``git diff-tree`` parsers, and the logic that points the engine
 at the right AWS-LC checkout.
@@ -225,10 +228,8 @@ def cherry_pick_local(
                 # counts as a clean backport instead of manual resolution.
                 if (
                     conflicts
-                    and all(
-                        bot._is_test_or_generated_file(c["path"]) for c in conflicts
-                    )
-                    and _drop_and_continue(wt, conflicts)
+                    and all(bot.is_test_or_generated_file(c["path"]) for c in conflicts)
+                    and drop_and_continue(wt, conflicts)
                 ):
                     dropped = conflicts
                 else:
@@ -241,7 +242,7 @@ def cherry_pick_local(
         return "error", str(exc), []
 
 
-def _drop_and_continue(wt: str, conflicts: List[dict]) -> bool:
+def drop_and_continue(wt: str, conflicts: List[dict]) -> bool:
     """Resolve a test/generated-only conflict by restoring the branch's version of
     each conflicting file (dropping the fix's test churn), then completing the
     cherry-pick. Returns True on success, False if it could not finish cleanly
@@ -291,7 +292,7 @@ def changed_files_with_status(commit: str) -> "Tuple[List[str], List[str]]":
       A brand-new file has no prior history, so there is no introducing commit to
       trace for it; we exclude it so introducer detection does not choke.
     """
-    output = bot._git(
+    output = bot.git(
         ["diff-tree", "--no-commit-id", "--name-status", "-r", commit],
         capture_output=True,
         text=True,
@@ -316,7 +317,7 @@ def branch_basenames(ref: str) -> Set[str]:
     A conservative anti-false-negative guard: a same-named file under a path our
     rename trace missed means the code may still be on the branch.
     """
-    out = bot._git(
+    out = bot.git(
         ["ls-tree", "-r", "--name-only", ref],
         check=False,
         capture_output=True,

@@ -1,5 +1,5 @@
 {
-  "_comment": "Machine-readable index of the REAL aws/aws-lc FIPS branches, derived from VERSIONING.md (end-of-support table + LTS note). Used by scripts/replay_real_cve.py to apply the support-window filter as of a fix's date. Confirm against VERSIONING.md before relying on it; end_of_support is month-precision (YYYY-MM) as published.",
+  "_comment": "Machine-readable index of the REAL aws/aws-lc FIPS branches, derived from VERSIONING.md (end-of-support table + LTS note). Used by testing/replay_real_cve.py to apply the support-window filter as of a fix's date. Confirm against VERSIONING.md before relying on it; end_of_support is month-precision (YYYY-MM) as published.",
   "updated": "2026-07-01",
   "source": "aws-lc VERSIONING.md (Deprecation of legacy FIPS branches)",
   "mainline": { "branch": "main" },

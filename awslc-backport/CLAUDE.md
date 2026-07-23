@@ -34,7 +34,7 @@ and `testing/` sit at the tool root.
   always `reset --soft base` + recommit so the fix collapses to its **net diff**,
   even from a multi-commit `git am`), patch-source resolution (`read_patch` /
   `resolve_patch_and_base`, with `--commit` accepting a single ref *or* a range
-  `A..B`/`A...B` via `_range_endpoints`), and the test-file confirmation prompt.
+  `A..B`/`A...B` via `range_endpoints`), and the test-file confirmation prompt.
 - `runstate.py` — the `analyze` -> `apply` cache (`save_run` / `load_run` /
   `delete_patch_artifacts`), stored inside the tool folder.
 - `verdicts.py` — `bucket_branches` (deterministic classification) and the two
@@ -46,7 +46,7 @@ and `testing/` sit at the tool root.
 - `common.py` — shared leaf module: the verdict constants (`AFFECTED` …, `LABEL`)
   and the `BackportError` type everyone can import without a cycle.
 - `engine.py` — deterministic core. Repo targeting (`set_repo_path` / `REPO_PATH`
-  / `_git`), branch resolution, `find_introducing_commit`, `is_branch_affected`,
+  / `git`), branch resolution, `find_introducing_commit`, `is_branch_affected`,
   `present_introducers`, `is_already_patched`, `vulnerable_preimage_present`, and
   the git/text helpers.
 - `ai.py` — `ai_impact_analysis` (advisory only; never acts alone). Bedrock via
@@ -69,7 +69,7 @@ local `backport/<branch>/<id>` branch; `ci` pushes it and opens a normal PR. A
 **conflicting** pick is `git cherry-pick --abort`ed — `cherry_pick_local` returns
 `("conflict", None, [{path, kind}, ...])`, leaving nothing behind (no
 committed-markers branch, no draft PR). One exception: a conflict confined to
-**test/generated files only** is auto-resolved by `_drop_and_continue` (restore
+**test/generated files only** is auto-resolved by `drop_and_continue` (restore
 the branch's version of each test file, i.e. drop the fix's test churn, then
 `cherry-pick --continue`) and returns `("clean", local_branch, dropped)` where
 *dropped* lists the test files — so a trivial test clash becomes a normal PR (noted
@@ -81,39 +81,45 @@ conflicts (the summary cell lists the clashing files and points at `resolve`);
 each AFFECTED branch checks it out in a **persistent** `add_worktree` and runs the
 cherry-pick live. A **clean** pick is aborted and skipped (`ci`/`apply` own clean
 backports; re-opening them here would clash on the same branch name). A
-**conflicting** pick drops the user into an interactive shell (`_edit_in_branch_shell`
+**conflicting** pick drops the user into an interactive shell (`edit_in_branch_shell`
 -> `subprocess.call([$SHELL], cwd=wt)`) *inside* that branch's worktree, so they
-edit the live conflict in place. On exit, `_stage_resolved` stages every unmerged
+edit the live conflict in place. On exit, `stage_resolved` stages every unmerged
 file that no longer has markers and returns the ones that still do; if any remain
 the user is offered a re-enter, otherwise `cherry-pick --continue` runs (unless the
 user already continued/aborted it themselves, detected via
-`_cherry_pick_in_progress` + a HEAD-vs-base check). Then it creates the local
+`cherry_pick_in_progress` + a HEAD-vs-base check). Then it creates the local
 branch, removes the worktree, and (after a final Y/N) opens one non-draft PR per
 **resolved** branch. `git rerere` is enabled (`enable_rerere`, autoupdate **off**
 on purpose) so a resolution recorded on one branch auto-applies to a twin branch's
 identical conflict but still surfaces marker-free for the user to verify. The
 user's own checkout is never touched; unfinished branches leave their worktree in
 place and are not PR'd. After opening PRs, if `--pr` was given, `resolve` posts an
-updated `_summary_table` comment on the source PR (reusing `ci`'s renderer) with
+updated `summary_table` comment on the source PR (reusing `ci`'s renderer) with
 the resolved branches now shown as opened PRs (`done`/`opened` cell kinds).
 
 `--in-place` swaps each conflicting branch into the user's working repo (detached)
-instead of a worktree — same resolve logic (`_resolve_branch_in_place`), guarded by
+instead of a worktree — same resolve logic (`resolve_branch_in_place`), guarded by
 a clean-tree check, restoring the original branch at the end.
 
-To avoid running the impact analysis twice, `ci` embeds a hidden machine-readable
-snapshot in its summary comment (`_plan_marker` -> `<!-- backport-bot-plan:{json} -->`
-with each branch's impact/outcome/conflict-files). With `--pr`, `resolve` reads the
-latest such marker (`_read_bot_plan`) and targets exactly the `conflict` branches
-— no second AI pass, and it seeds the final summary with the branches `ci` already
-opened. `--reanalyze` forces the local `bucket_branches`+`resolve_inconclusive`
-path instead; that path is also the automatic fallback when no marker is found.
+To avoid running the impact analysis twice, `ci` attaches a machine-readable
+snapshot to its summary comment (`plan_marker`): a fenced ` ```json ` block
+(inside a collapsed `<details>`) tagged with a `backport_bot_plan` sentinel key,
+carrying each branch's impact/outcome/conflict-files. A fenced JSON block is more
+reliable to scrape than the old hidden HTML comment (it can't be stripped as a
+comment, can't be broken by a `-->` in the data, and stays human-inspectable).
+With `--pr`, `resolve` reads the latest such block (`read_bot_plan` scans every
+fenced JSON block and picks the newest one bearing the sentinel) and targets
+exactly the `conflict` branches — no analysis pass at all, and it seeds the final
+summary with the branches `ci` already opened. `--reanalyze` forces the local
+`bucket_branches`(+`resolve_inconclusive`) path instead; that path is also the
+automatic fallback when no plan is found. `resolve` defaults to **no AI** (it acts
+on an already-decided plan); `--ai` re-enables it on the `--reanalyze` path.
 
-The resolution engine itself is `_run_resolution(args, fix_sha, subject, buckets,
+The resolution engine itself is `run_resolution(args, fix_sha, subject, buckets,
 targets, preopened, source_pr)`, shared by two front-ends: `cmd_resolve` (targets
 from the PR plan or a local analysis) and `apply` (which, after a local
 cherry-pick session conflicts, prompts the user and hands off the just-conflicted
-branches directly — no re-analysis, no second bucketing). `_assert_fork_remote`
+branches directly — no re-analysis, no second bucketing). `assert_fork_remote`
 only gates the push step, so purely-local resolution works regardless of remote.
 
 ## Bucketing (`verdicts.bucket_branches`)
@@ -149,8 +155,15 @@ AI auditor/tie-breaker (used by the replay harness). Key points:
 
 ## Testing
 
-- `testing/test_engine.py` — fast, repo-free unit tests of the pure helpers.
-  Run: `python3 -m unittest testing.test_engine`.
+- `testing/test_engine.py` — fast, repo-free unit tests of the pure engine
+  helpers (whitespace/comment/boilerplate/date logic). Each test says what it
+  catches and why.
+- `testing/test_plan_roundtrip.py` — locks the `ci` -> `resolve` hand-off: the
+  machine-readable plan `ci` attaches to the PR summary (`plan_marker`) must
+  scrape back cleanly (`resolve.parse_plan`). Guards the format the two modules
+  share.
+- Run all unit tests: `python3 -m unittest discover -s testing -p 'test_*.py'`
+  (no repo, creds, or network).
 - `testing/replay_real_cve.py` — the characterization test. Rolls a throwaway
   sandbox back to before each fix (real objects borrowed read-only via git
   alternates; the real repo is never mutated), runs the engine, and grades it

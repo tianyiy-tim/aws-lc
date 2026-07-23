@@ -1,12 +1,20 @@
 # AWS-LC backport bot (post-merge automation).
 #
-# When a PR is merged carrying the `needs-backport` label, analyze the merged
-# commit with the impact engine (AI layer on) and open a backport PR on THIS
-# fork for every AFFECTED release branch. Clean cherry-picks become PRs (never
-# auto-merged); conflicts are reported back on the source PR for manual work.
+# Trigger:  a PR is merged that carries the `needs-backport` label.
+# Action:   analyze the merged commit with the impact engine (AI layer on) and,
+#           for every AFFECTED release branch, open a backport PR on THIS fork.
+# Outcomes per branch (shown in a summary comment on the merged PR):
+#   - clean cherry-pick  -> a normal PR is opened (never auto-merged)
+#   - test-only conflict -> auto-resolved, opened as a normal PR
+#   - real conflict      -> reported only; resolve locally with `backport resolve`
 #
-# The tool (awslc-backport/src/main.py) refuses to target upstream aws/aws-lc, so
-# this only ever opens PRs within the fork it runs in.
+# Setup:  copy this file into the fork's `.github/workflows/`, and add a
+#         `BEDROCK_ROLE_ARN` secret (OIDC role for the AI layer). Without the
+#         secret the tool still runs deterministically and flags anything it
+#         cannot confirm as AFFECTED (it over-flags, never misses).
+#
+# Safety: the tool (awslc-backport/src/main.py) refuses to target upstream
+#         aws/aws-lc, so it only ever opens PRs within the fork it runs in.
 name: Backport bot
 
 on:
@@ -58,6 +66,8 @@ jobs:
           git config user.name "aws-lc-backport-bot"
           git config user.email "backport-bot@users.noreply.github.com"
 
+      # Analyze the merged commit and open a backport PR per AFFECTED branch,
+      # then post the status table (+ machine-readable plan) on the merged PR.
       - name: Analyze and open backport PRs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

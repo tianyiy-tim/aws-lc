@@ -1,6 +1,9 @@
 """
 Patch handling.
 
+Layer: input plumbing. Builds on ``gitutil`` + ``runstate``; used by the
+``analyze`` / ``apply`` / ``resolve`` commands to obtain the fix to analyze.
+
 Two jobs: (1) turn a patch -- a ``git diff`` or ``git format-patch`` -- into a
 real (temporary) commit the engine can analyze, and (2) resolve where a run's
 patch comes from (``--commit``, an explicit ``--patch`` file, the working tree,
@@ -22,7 +25,7 @@ from runstate import load_run
 # --------------------------------------------------------------------------
 
 
-def _is_format_patch(patch: str) -> bool:
+def is_format_patch(patch: str) -> bool:
     """True if this is ``git format-patch`` output rather than a plain ``git diff``.
 
     ``git format-patch`` writes the patch as an email (it begins with a
@@ -34,7 +37,7 @@ def _is_format_patch(patch: str) -> bool:
     return bool(head) and head[0].startswith("From ")
 
 
-def _commit_message_from_patch(
+def commit_message_from_patch(
     patch: str, fallback: str = "Backport candidate (from patch)"
 ) -> str:
     """Use the patch's ``Subject:`` line as the commit message, else a fallback."""
@@ -70,7 +73,7 @@ def commit_from_patch(
     # The patch is piped to git over stdin, so it never gets written to disk.
     with temp_worktree(base) as worktree:
         applied = False
-        if _is_format_patch(patch):
+        if is_format_patch(patch):
             am_args = ["am", "--3way"] if three_way else ["am"]
             am = git(*am_args, check=False, cwd=worktree, stdin=patch)
             if am.returncode == 0:
@@ -105,7 +108,7 @@ def commit_from_patch(
             "--quiet",
             "--allow-empty",
             "-m",
-            _commit_message_from_patch(patch),
+            commit_message_from_patch(patch),
             cwd=worktree,
         )
         sha = git("rev-parse", "HEAD", cwd=worktree).stdout.strip()
@@ -122,7 +125,7 @@ def is_empty_patch(patch: str) -> bool:
     return not patch.strip()
 
 
-def _range_endpoints(spec: str) -> "Optional[Tuple[str, str]]":
+def range_endpoints(spec: str) -> "Optional[Tuple[str, str]]":
     """If *spec* is a commit range, return ``(base, head)`` to diff, else None.
 
     ``A..B`` -> ``(A, B)`` (the net change from A to B).
@@ -143,7 +146,7 @@ def _range_endpoints(spec: str) -> "Optional[Tuple[str, str]]":
     return None
 
 
-def _explicit_patch_source(args) -> "Optional[Tuple[str, str, str]]":
+def explicit_patch_source(args) -> "Optional[Tuple[str, str, str]]":
     """``(patch, base, source)`` for an explicit ``--commit`` or ``--patch``, else None.
 
     The one place that turns ``--commit`` or ``--patch`` into a patch. ``--commit``
@@ -155,7 +158,7 @@ def _explicit_patch_source(args) -> "Optional[Tuple[str, str, str]]":
     :func:`resolve_patch_and_base` (apply). *source* is ``"commit"`` or ``"patch"``.
     """
     if getattr(args, "commit", None):
-        rng = _range_endpoints(args.commit)
+        rng = range_endpoints(args.commit)
         if rng:
             base, head = rng
             return git("diff", f"{base}..{head}").stdout, (args.base or base), "commit"
@@ -176,7 +179,7 @@ def read_patch(args) -> "Tuple[str, str, bool]":
       (nothing)       capture the repo's uncommitted diff ``git diff HEAD``
                       (base = current HEAD) -- the normal pre-merge flow.
     """
-    explicit = _explicit_patch_source(args)
+    explicit = explicit_patch_source(args)
     if explicit:
         patch, base, source = explicit
         return patch, base, source == "patch"
@@ -191,7 +194,7 @@ def resolve_patch_and_base(args) -> "Tuple[str, str, Optional[dict]]":
     With an explicit ``--commit``/``--patch``, read those and skip the saved run.
     Otherwise reuse the patch and base cached by the last ``analyze``.
     """
-    explicit = _explicit_patch_source(args)
+    explicit = explicit_patch_source(args)
     if explicit:
         patch, base, _ = explicit
         return patch, base, None
@@ -207,7 +210,7 @@ def resolve_patch_and_base(args) -> "Tuple[str, str, Optional[dict]]":
 _TEST_SUFFIXES = ("_test.cc", "_test.cpp", "_test.c", "_test.cxx")
 
 
-def _patch_paths(patch: str) -> Set[str]:
+def patch_paths(patch: str) -> Set[str]:
     """File paths touched by the patch, parsed from the diff headers."""
     paths: Set[str] = set()
     for line in patch.splitlines():
@@ -220,7 +223,7 @@ def _patch_paths(patch: str) -> Set[str]:
     return paths
 
 
-def _ask_yn(prompt: str) -> bool:
+def ask_yn(prompt: str) -> bool:
     """Prompt until the user answers Y or N. Returns True for Y."""
     while True:
         try:
@@ -242,9 +245,9 @@ def confirm_test_file(patch: str) -> bool:
     diff. If one is present, confirm it is the right test; if none is present,
     confirm the user wants to proceed without one. Answering N aborts.
     """
-    tests = sorted(p for p in _patch_paths(patch) if p.endswith(_TEST_SUFFIXES))
+    tests = sorted(p for p in patch_paths(patch) if p.endswith(_TEST_SUFFIXES))
     if tests:
         print(f"Test file found in the patch: {', '.join(tests)}")
-        return _ask_yn("Is this the test file for your patch?")
+        return ask_yn("Is this the test file for your patch?")
     print("No test file (e.g. *_test.cc) found in the patch.")
-    return _ask_yn("Proceed without a test file?")
+    return ask_yn("Proceed without a test file?")

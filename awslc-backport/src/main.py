@@ -2,6 +2,10 @@
 """
 backport - local, patch-driven CLI for the AWS-LC backport bot.
 
+Layer: entrypoint. Wires the four command modules (analyze / apply / ci /
+resolve) into one argument parser and dispatches to them. See the module map at
+the end of this docstring for how the rest of the package fits together.
+
 Runs the deterministic impact engine locally and from a PATCH rather than a
 merged commit, so an embargoed security fix can be assessed (and backported to
 local branches) before any public code change.
@@ -30,11 +34,19 @@ Subcommands:
                       remotes only.
 
   resolve [--pr N | --commit <sha>]
-                      Interactive, local conflict resolution: for every AFFECTED
-                      branch that conflicts, walk the conflicted files one by one
-                      (Y/N) in a real worktree you edit, with git rerere on so a
-                      resolution is reused across sibling branches. When done,
-                      optionally open one normal PR per branch. Fork remotes only.
+                      Interactive, local conflict resolution. Reads the backport
+                      bot's already-decided plan from the PR (or the last analyze
+                      run), so it needs no AI -- it just fixes the branches that
+                      conflicted. For each, it checks the branch out in your
+                      CURRENT repo (in-place, the default) with the conflict live,
+                      you edit and exit, and git rerere reuses a resolution across
+                      sibling branches. When done, optionally opens one normal PR
+                      per branch. Fork remotes only.
+
+                      Common case is just:  backport resolve --pr N
+                      (--repo defaults to the current directory; --ai re-enables
+                      the AI on the --reanalyze path; --worktree isolates instead
+                      of editing in place).
 
   clear               Remove the saved run state.
 
@@ -65,7 +77,7 @@ from resolve import cmd_resolve
 # --------------------------------------------------------------------------
 
 
-def _add_common(p: argparse.ArgumentParser) -> None:
+def add_common(p: argparse.ArgumentParser) -> None:
     """Flags shared by every subcommand."""
     p.add_argument(
         "--repo",
@@ -83,7 +95,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_analyze(sub) -> None:
+def add_analyze(sub) -> None:
     p = sub.add_parser(
         "analyze", help="give an affected / not affected verdict for every branch"
     )
@@ -118,11 +130,11 @@ def _add_analyze(sub) -> None:
         help="do not delete the patch file after analysis",
     )
     p.add_argument("--json", action="store_true", help="emit JSON")
-    _add_common(p)
+    add_common(p)
     p.set_defaults(func=cmd_analyze)
 
 
-def _add_apply(sub) -> None:
+def add_apply(sub) -> None:
     p = sub.add_parser("apply", help="cherry-pick the patch onto local branches")
     p.add_argument("--branches", nargs="+", help="branches to apply to")
     p.add_argument(
@@ -153,11 +165,11 @@ def _add_apply(sub) -> None:
         action="store_true",
         help="do not delete the patch file / cached run after a clean apply",
     )
-    _add_common(p)
+    add_common(p)
     p.set_defaults(func=cmd_apply, in_place=True)
 
 
-def _add_ci(sub) -> None:
+def add_ci(sub) -> None:
     p = sub.add_parser(
         "ci",
         help="post-merge: open backport PRs on the fork for a merged commit",
@@ -179,11 +191,11 @@ def _add_ci(sub) -> None:
         action="store_true",
         help="analyze and cherry-pick locally but do not push or open PRs",
     )
-    _add_common(p)
+    add_common(p)
     p.set_defaults(func=cmd_ci, json=False)
 
 
-def _add_resolve(sub) -> None:
+def add_resolve(sub) -> None:
     p = sub.add_parser(
         "resolve",
         help="interactively resolve backport conflicts locally, one PR per branch",
@@ -194,20 +206,14 @@ def _add_resolve(sub) -> None:
         "--reanalyze",
         action="store_true",
         help="recompute the affected/conflict set locally instead of reading the "
-        "backport bot's summary from the PR (re-runs the impact analysis)",
-    )
-    p.add_argument(
-        "--in-place",
-        dest="in_place",
-        action="store_true",
-        help="(default) check each conflicting branch out in your current repo so "
-        "your open IDE reflects it; needs a clean tree",
+        "backport bot's plan from the PR (re-runs the impact analysis)",
     )
     p.add_argument(
         "--worktree",
         dest="in_place",
         action="store_false",
-        help="resolve in an isolated throwaway worktree instead of your checkout",
+        help="resolve in an isolated throwaway worktree instead of your checkout "
+        "(default: resolve in-place in your current repo so your IDE reflects it)",
     )
     p.add_argument(
         "--remote",
@@ -215,20 +221,23 @@ def _add_resolve(sub) -> None:
         help="fork remote to push branches / open PRs on (default origin)",
     )
     p.add_argument(
-        "--no-ai",
-        action="store_true",
-        help="deterministic only; do not consult the AI (default: AI on)",
+        "--ai",
+        dest="no_ai",
+        action="store_false",
+        help="consult the AI when reanalyzing locally (default: off -- resolve "
+        "reads the already-decided plan from the PR/last analyze, so AI is not "
+        "needed)",
     )
-    _add_common(p)
-    p.set_defaults(func=cmd_resolve, json=False, in_place=True)
+    add_common(p)
+    p.set_defaults(func=cmd_resolve, json=False, in_place=True, no_ai=True)
 
 
-def _add_clear(sub) -> None:
+def add_clear(sub) -> None:
     p = sub.add_parser(
         "clear",
         help="remove the saved run state (.backport-runs/) from the tool folder",
     )
-    _add_common(p)
+    add_common(p)
     p.set_defaults(func=cmd_clear)
 
 
@@ -239,11 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local, patch-driven AWS-LC backport impact analysis + apply.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
-    _add_analyze(sub)
-    _add_apply(sub)
-    _add_ci(sub)
-    _add_resolve(sub)
-    _add_clear(sub)
+    add_analyze(sub)
+    add_apply(sub)
+    add_ci(sub)
+    add_resolve(sub)
+    add_clear(sub)
     return ap
 
 

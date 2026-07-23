@@ -59,8 +59,9 @@ git -C <aws-lc> diff > fix.patch
 # cherry-pick onto local backport branches (no push, no PR):
 ./backport apply --all-affected --repo <aws-lc>
 
-# interactively resolve any conflicts and open one PR per affected branch:
-./backport resolve --pr <number> --repo <aws-lc>     # or --commit <sha>
+# interactively resolve any conflicts and open one PR per affected branch
+# (run from inside the checkout; no AI, in-place, and repo are all default):
+cd <aws-lc> && backport resolve --pr <number>       # or --commit <sha>
 ```
 
 **Fixes spread across several commits.** Not every fix is one commit. `analyze`
@@ -134,31 +135,35 @@ comment** on the source PR — the same table `ci` produced, but with the
 previously-conflicting branches now showing ✅ and their opened backport PR. Your
 own checkout is never touched.
 
+From inside your AWS-LC checkout, the whole thing is one command:
+
 ```bash
-./backport resolve --pr 42 --repo <aws-lc>
-./backport resolve --commit <sha> --no-ai --repo <aws-lc>
+cd <aws-lc>
+backport resolve --pr 42        # that's it
 ```
+
+`resolve` defaults to everything you almost always want: it reads the PR plan (so
+**no AI** is needed — pass `--ai` only to re-enable it on `--reanalyze`), edits
+**in your current checkout** (`--repo` defaults to the directory you're in), and
+opens the PRs at the end. So `--no-ai`, `--in-place`, and `--repo` are no longer
+something you type.
 
 When given `--pr`, `resolve` reads the backport bot's own summary comment from the
-PR (a hidden machine-readable snapshot `ci` embeds) to learn exactly which
-branches conflicted — so it does **not** re-run the impact analysis (no second AI
-pass, and it targets precisely what `ci` reported). Pass `--reanalyze` to ignore
-the comment and recompute locally instead (deterministic, or AI unless `--no-ai`);
-this is also the automatic fallback when there is no bot summary (e.g. `--commit`).
+PR (a fenced `json` snapshot `ci` attaches) to learn exactly which branches
+conflicted — so it does **not** re-run the impact analysis and targets precisely
+what `ci` reported. Pass `--reanalyze` to ignore the comment and recompute locally
+instead (deterministic by default; add `--ai` for the AI advisory); this is also
+the automatic fallback when there is no bot summary (e.g. `--commit`).
 
-By default `resolve` edits **in your own checkout** (`--in-place`): it checks each
-conflicting branch out (detached) in your working repo, so your already-open IDE
-window shows the conflict live; you fix it, answer the prompt, and it restores
-your original branch when done. It needs a clean working tree. When a conflict was
-already solved before, `rerere` re-applies it and `resolve` says so ("auto-applied
-by rerere, just verify"). Prefer isolation? `--worktree` does it in a throwaway
-worktree instead (nothing touches your checkout). Tip: run from a checkout where
-the tool lives *outside* the repo (or use `--worktree`) to avoid briefly hiding
-`awslc-backport/` while a release branch is checked out.
-
-```bash
-./backport resolve --pr 42 --in-place --repo <aws-lc>
-```
+`--in-place` (the default) checks each conflicting branch out (detached) in your
+working repo, so your already-open IDE window shows the conflict live; you fix it,
+answer the prompt, and it restores your original branch when done. It needs a
+clean working tree. When a conflict was already solved before, `rerere` re-applies
+it and `resolve` says so ("auto-applied by rerere, just verify"). Prefer isolation?
+`--worktree` does it in a throwaway worktree instead (nothing touches your
+checkout). Tip: run from a checkout where the tool lives *outside* the repo (or
+use `--worktree`) to avoid briefly hiding `awslc-backport/` while a release branch
+is checked out.
 
 Like `ci`, `resolve` targets a fork only. It is interactive, so run it in a
 terminal (not a pipe/CI).
@@ -190,8 +195,10 @@ caps) live in one place, **`model-config.json`** at the tool root, loaded by
 ## Testing
 
 ```bash
-# Unit tests (no repo, creds, or network):
-python3 -m unittest testing.test_engine
+# Unit tests (no repo, creds, or network) -- runs every testing/test_*.py:
+python3 -m unittest discover -s testing -p 'test_*.py'
+#   test_engine.py         pure engine helpers (whitespace/comment/date logic)
+#   test_plan_roundtrip.py  the ci -> resolve PR-plan hand-off contract
 
 # Real replays (needs a local aws-lc clone; set AWS_LC_REPO or pass --repo):
 python3 testing/replay_real_cve.py --file testing/reliable_cves.txt \

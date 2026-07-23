@@ -1,6 +1,9 @@
 """
 The ``ci`` command: post-merge automation for GitHub Actions.
 
+Layer: command. Builds on ``gitutil`` + ``verdicts`` + ``render``; wired into the
+CLI by ``main``, and its PR/summary helpers are reused by ``resolve``.
+
 Given a merged commit, analyze every supported branch (AI layer on) and open a
 backport PR on the fork for each AFFECTED branch. Clean cherry-picks become PRs
 into the release branch (never auto-merged); conflicts/errors are reported and,
@@ -25,13 +28,13 @@ from verdicts import bucket_branches, resolve_inconclusive
 # --------------------------------------------------------------------------
 
 
-def _gh(*args: str, check: bool = True):
+def gh(*args: str, check: bool = True):
     """Run the GitHub CLI in the target repo. ``gh`` reads GH_TOKEN/GITHUB_TOKEN
     from the environment, which the workflow provides."""
     return run(["gh", *args], check=check)
 
 
-def _assert_fork_remote(remote: str) -> None:
+def assert_fork_remote(remote: str) -> None:
     """Refuse to run if *remote* points at upstream aws/aws-lc. CI may only push
     branches and open PRs on a fork, never on the canonical repository."""
     url = git("remote", "get-url", remote).stdout.strip()
@@ -47,15 +50,15 @@ def _assert_fork_remote(remote: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def _test_only(conflicts) -> bool:
+def test_only(conflicts) -> bool:
     """True if every conflicting path is a test/generated file (not real source),
     which usually means the source fix applied cleanly and only a test hunk clashed."""
     return bool(conflicts) and all(
-        bot._is_test_or_generated_file(c["path"]) for c in conflicts
+        bot.is_test_or_generated_file(c["path"]) for c in conflicts
     )
 
 
-def _open_backport_pr(
+def open_backport_pr(
     branch: str,
     local_branch: str,
     fix_sha: str,
@@ -101,7 +104,7 @@ def _open_backport_pr(
     )
     if push.returncode != 0:
         return f"error: push failed: {(push.stderr or push.stdout).strip()}"
-    pr = _gh(
+    pr = gh(
         "pr",
         "create",
         "--base",
@@ -119,7 +122,7 @@ def _open_backport_pr(
     return pr.stdout.strip()
 
 
-def _backport_cell(state: str, outcome) -> str:
+def backport_cell(state: str, outcome) -> str:
     """Render the 'Backport' column for one branch. *outcome* is (kind, value)."""
     if state == ALREADY:
         return "already applied"
@@ -132,7 +135,7 @@ def _backport_cell(state: str, outcome) -> str:
         return f"⚠️ {value}"
     if kind == "conflict":
         names = ", ".join(f"`{os.path.basename(c['path'])}`" for c in value)
-        suffix = " (test-only, likely trivial)" if _test_only(value) else ""
+        suffix = " (test-only, likely trivial)" if test_only(value) else ""
         return f"⚠️ merge conflict: {names} — resolve locally{suffix}"
     if kind == "done":
         return "✅ backported"
@@ -140,9 +143,7 @@ def _backport_cell(state: str, outcome) -> str:
     return f"✅ [#{num}]({value})"
 
 
-def _summary_table(
-    fix_sha: str, subject: str, buckets, outcomes, source_pr=None
-) -> str:
+def summary_table(fix_sha: str, subject: str, buckets, outcomes, source_pr=None) -> str:
     """Build the markdown status table (AFFECTED branches first)."""
     order = {AFFECTED: 0, ALREADY: 1, NOT_AFFECTED: 2}
     rows = sorted(buckets.items(), key=lambda kv: order.get(kv[1], 9))
@@ -158,8 +159,9 @@ def _summary_table(
     lines = [
         f"### 🔁 Backport bot — {subject}",
         "",
-        f"Analyzed `{fix_sha[:12]}` across {len(buckets)} supported branches. "
-        "Nothing is auto-merged — every backport PR needs human review.",
+        f"Checked `{fix_sha[:12]}` against {len(buckets)} supported release "
+        "branches. Backports open as normal PRs — **nothing is auto-merged**, so "
+        "every one still needs human review.",
         "",
         "| Branch | Impact | Backport |",
         "| --- | --- | --- |",
@@ -167,35 +169,59 @@ def _summary_table(
     for branch, state in rows:
         lines.append(
             f"| `{branch}` | {LABEL[state]} | "
-            f"{_backport_cell(state, outcomes.get(branch))} |"
+            f"{backport_cell(state, outcomes.get(branch))} |"
         )
     lines += [
         "",
-        f"**{opened} opened · {manual} need manual backport · "
-        f"{not_aff} not affected · {already} already applied**",
+        f"**Summary:** {opened} PR(s) opened · {manual} need a manual backport · "
+        f"{not_aff} not affected · {already} already applied.",
     ]
     if manual:
         target = f"--pr {source_pr}" if source_pr else f"--commit {fix_sha[:12]}"
         lines += [
             "",
-            "> ℹ️ Conflicting branches were **not** modified. Resolve them locally — "
-            "each conflict opens in your checkout to edit, then a PR is opened per "
-            "branch:\n"
-            f"> `backport resolve {target}`",
+            f"#### ⚠️ {manual} branch(es) need a manual backport",
+            "",
+            "They have merge conflicts, so the bot changed nothing on them. "
+            "Resolve them locally in one step — each conflict opens in your own "
+            "checkout for you to edit, then one PR is opened per branch:",
+            "",
+            "```bash",
+            f"backport resolve {target}",
+            "```",
         ]
     return "\n".join(lines)
 
 
-_PLAN_MARKER_PREFIX = "<!-- backport-bot-plan:"
-_PLAN_MARKER_SUFFIX = " -->"
+# Sentinel key that marks our JSON block so `resolve` can tell it apart from any
+# other fenced code in the comment. Bump the version if the schema changes.
+PLAN_SCHEMA_VERSION = 1
 
 
-def _plan_marker(fix_sha: str, subject: str, buckets, outcomes) -> str:
-    """A hidden, machine-readable snapshot of the run, embedded in the summary
-    comment. ``resolve`` reads this back from the PR so it can target exactly the
-    branches this run flagged -- without re-running the impact analysis (AI).
+def plan_marker(fix_sha: str, subject: str, buckets, outcomes) -> str:
+    """A machine-readable snapshot of the run, attached to the summary comment as a
+    fenced ``json`` block inside a collapsed ``<details>`` section.
 
-    Invisible when the comment is rendered (it's an HTML comment).
+    ``resolve`` reads this back from the PR (see ``resolve.read_bot_plan``) so it
+    can target exactly the branches this run flagged -- without re-running the
+    impact analysis. A fenced JSON block is more reliable to scrape than a hidden
+    HTML comment (it can't be stripped as a comment, can't be broken by a ``-->``
+    in the data, and stays human-inspectable if a resolve run misbehaves). The
+    ``backport_bot_plan`` key is the sentinel the reader keys off.
+
+    Schema::
+
+        {
+          "backport_bot_plan": 1,          # sentinel + schema version
+          "fix": "<sha>", "subject": "...",
+          "branches": {
+            "<branch>": {
+              "impact": "affected|not_affected|already_patched",
+              "outcome": "opened|done|conflict|error|dry-run|null",
+              "files": ["..."]            # present only when outcome == conflict
+            }, ...
+          }
+        }
     """
     branches = {}
     for branch, state in buckets.items():
@@ -204,19 +230,30 @@ def _plan_marker(fix_sha: str, subject: str, buckets, outcomes) -> str:
         if kind == "conflict":
             entry["files"] = [c["path"] for c in value]
         branches[branch] = entry
-    payload = {"fix": fix_sha, "subject": subject, "branches": branches}
-    blob = json.dumps(payload, separators=(",", ":"))
-    return f"{_PLAN_MARKER_PREFIX}{blob}{_PLAN_MARKER_SUFFIX}"
+    payload = {
+        "backport_bot_plan": PLAN_SCHEMA_VERSION,
+        "fix": fix_sha,
+        "subject": subject,
+        "branches": branches,
+    }
+    blob = json.dumps(payload, indent=2)
+    return (
+        "<details>\n"
+        "<summary>backport-bot plan (machine-readable — read by "
+        "<code>backport resolve</code>)</summary>\n\n"
+        f"```json\n{blob}\n```\n\n"
+        "</details>"
+    )
 
 
-def _ci_report(args, fix_sha, subject, buckets, outcomes) -> None:
+def ci_report(args, fix_sha, subject, buckets, outcomes) -> None:
     """Print the per-branch status table, post it as a comment on the source PR,
     and emit GitHub Actions warnings for branches that need manual backport."""
-    table = _summary_table(fix_sha, subject, buckets, outcomes, source_pr=args.pr)
+    table = summary_table(fix_sha, subject, buckets, outcomes, source_pr=args.pr)
     print("\n" + table)
     if args.pr and not args.dry_run:
-        body = table + "\n\n" + _plan_marker(fix_sha, subject, buckets, outcomes)
-        _gh("pr", "comment", str(args.pr), "--body", body, check=False)
+        body = table + "\n\n" + plan_marker(fix_sha, subject, buckets, outcomes)
+        gh("pr", "comment", str(args.pr), "--body", body, check=False)
     for branch, outcome in outcomes.items():
         if outcome[0] in ("conflict", "error"):
             print(f"::warning::backport to {branch} needs manual resolution")
@@ -230,7 +267,7 @@ def _ci_report(args, fix_sha, subject, buckets, outcomes) -> None:
 def cmd_ci(args) -> int:
     """Analyze a merged commit and open a backport PR on the fork for every
     AFFECTED branch."""
-    _assert_fork_remote(args.remote)
+    assert_fork_remote(args.remote)
     fix_sha, subject = resolve_commit(args.commit)
 
     branches = bot.sort_branches(bot.get_supported_branches())
@@ -267,7 +304,7 @@ def cmd_ci(args) -> int:
                 "resolve locally with `backport resolve`"
             )
             continue
-        url = _open_backport_pr(
+        url = open_backport_pr(
             branch,
             detail,
             fix_sha,
@@ -292,5 +329,5 @@ def cmd_ci(args) -> int:
             )
             print(f"  [OK] {branch}: {url}{note}")
 
-    _ci_report(args, fix_sha, subject, buckets, outcomes)
+    ci_report(args, fix_sha, subject, buckets, outcomes)
     return 0

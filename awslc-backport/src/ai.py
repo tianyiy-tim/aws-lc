@@ -1,6 +1,9 @@
 """
 AI advisory layer (impact analysis only).
 
+Layer: impact core (advisory). Builds on ``engine`` + ``settings``; consulted
+only by ``verdicts``. Never acts on its own.
+
 `ai_impact_analysis` asks Claude (via Amazon Bedrock) whether a branch is
 affected, in one of two roles: AUDITOR (deterministic said affected -> look for a
 false positive) or TIE-BREAKER (deterministic inconclusive -> second opinion).
@@ -23,12 +26,12 @@ import settings
 from engine import (
     _AI_MAX_FILE_BYTES,
     _BEDROCK_MODEL_ID,
-    _fix_removed_lines,
-    _get_commit_diff,
-    _get_file_on_branch,
-    _is_noise_line,
-    _norm_ws,
-    _show_file,
+    fix_removed_lines,
+    get_commit_diff,
+    get_file_on_branch,
+    is_noise_line,
+    norm_ws,
+    show_file,
     vulnerable_preimage_present,
 )
 
@@ -37,7 +40,7 @@ from engine import (
 # ---------------------------------------------------------------------------
 
 
-def _ai_client():
+def ai_client():
     """An AnthropicBedrock client if the SDK and AWS credentials are available,
     else None (BACKPORT_DISABLE_AI=1 also forces None)."""
     if _anthropic_module is None:
@@ -99,7 +102,7 @@ _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{4,}")
 # ---------------------------------------------------------------------------
 
 
-def _distinctive_symbols(commit, file):
+def distinctive_symbols(commit, file):
     """Identifiers the fix touches in *file*: enclosing-function names from hunk
     headers plus notable identifiers on changed lines, minus common C tokens.
     These are the things whose presence on a branch signals real applicability."""
@@ -125,7 +128,7 @@ def _distinctive_symbols(commit, file):
                 "+++",
                 "---",
             ):
-                if _is_noise_line(
+                if is_noise_line(
                     line[1:], file
                 ):  # don't pull identifiers from comments
                     continue
@@ -134,15 +137,15 @@ def _distinctive_symbols(commit, file):
     return syms[:10]
 
 
-def _region_around(content, needles, window=60):
+def region_around(content, needles, window=60):
     """Slice of *content* centered on the first line matching any of *needles*
     (whitespace-normalized), with +/- *window* lines of context. Returns
     (excerpt, (start_line, end_line)) or None if nothing matches — which lets the
     model see the *relevant* code instead of a head-truncated file."""
     lines = content.splitlines()
-    norm = [_norm_ws(x) for x in lines]
+    norm = [norm_ws(x) for x in lines]
     for nd in needles:
-        n = _norm_ws(nd)
+        n = norm_ws(nd)
         if not n:
             continue
         for i, ln in enumerate(norm):
@@ -153,15 +156,15 @@ def _region_around(content, needles, window=60):
     return None
 
 
-def _symbol_presence(commit, changed_files, branch_ref):
+def symbol_presence(commit, changed_files, branch_ref):
     """Factual table of whether the symbols the fix touches exist on the branch.
     Returns a markdown snippet, or '' if nothing distinctive was found."""
     rows = []
     for f in changed_files[:6]:
-        content = _show_file(branch_ref, f)
+        content = show_file(branch_ref, f)
         if content is None:
             continue
-        for sym in _distinctive_symbols(commit, f):
+        for sym in distinctive_symbols(commit, f):
             present = re.search(rf"\b{re.escape(sym)}\b", content) is not None
             rows.append(f"- `{sym}` ({f}): {'present' if present else 'ABSENT'}")
     if not rows:
@@ -278,20 +281,20 @@ _ADVISORY_WRAP = (
 )
 
 
-def _branch_file_context(commit, branch, branch_ref, changed_files):
+def branch_file_context(commit, branch, branch_ref, changed_files):
     """Snapshots of the fixed files as they exist on the branch (excerpted around
     the change), plus the list of files that are absent under any name. Returns
     (file_context_markdown, absent_files, any_present)."""
     parts, absent = [], []
     for f in changed_files[:6]:  # cap file count to control prompt size
-        content, resolved = _get_file_on_branch(f, branch_ref, commit=commit)
+        content, resolved = get_file_on_branch(f, branch_ref, commit=commit)
         if not content:
             absent.append(f)
             continue
         label = f if resolved == f else f"{resolved} (pre-rename path of {f})"
         # Center the excerpt on the changed code rather than head-truncating.
-        full = _show_file(branch_ref, resolved) or content
-        region = _region_around(full, _fix_removed_lines(commit, f))
+        full = show_file(branch_ref, resolved) or content
+        region = region_around(full, fix_removed_lines(commit, f))
         if region:
             excerpt, (lo, hi) = region
             parts.append(
@@ -308,7 +311,7 @@ def _branch_file_context(commit, branch, branch_ref, changed_files):
     return context, absent, bool(parts)
 
 
-def _absence_note(absent_files, any_present):
+def absence_note(absent_files, any_present):
     """Explicit 'verified not present' signal for the files absent on the branch,
     so the model reads absence as evidence, not missing information."""
     if not absent_files:
@@ -321,7 +324,7 @@ def _absence_note(absent_files, any_present):
     return note + (_SOME_ABSENT_NOTE if any_present else _ALL_ABSENT_NOTE)
 
 
-def _preimage_note(det_verdict, commit, changed_files, branch_ref):
+def preimage_note(det_verdict, commit, changed_files, branch_ref):
     """For the auditor, add the decisive 'removed lines provably absent' signal
     when it applies, so the model commits to a verdict instead of hedging."""
     if (
@@ -332,12 +335,12 @@ def _preimage_note(det_verdict, commit, changed_files, branch_ref):
     return ""
 
 
-def _build_user_prompt(
+def build_user_prompt(
     commit, branch, branch_ref, changed_files, introducing_commits, det_verdict
 ):
     """Assemble the user message: fix diff + branch file context + absence /
     symbol / pre-image signals + the role-specific task block."""
-    file_context, absent_files, any_present = _branch_file_context(
+    file_context, absent_files, any_present = branch_file_context(
         commit, branch, branch_ref, changed_files
     )
     introducer_list = ", ".join(list(introducing_commits)[:5]) or "(none found)"
@@ -352,17 +355,17 @@ def _build_user_prompt(
         f"**Target branch:** `{branch}`\n"
         f"**Introducing commit(s):** {introducer_list}\n\n"
         f"### Patch diff (what the fix changes on main)\n"
-        f"```diff\n{_get_commit_diff(commit)}\n```\n\n"
+        f"```diff\n{get_commit_diff(commit)}\n```\n\n"
         f"### Relevant files on the target branch\n"
         f"{file_context}"
-        f"{_absence_note(absent_files, any_present)}"
-        f"{_symbol_presence(commit, changed_files, branch_ref)}"
-        f"{_preimage_note(det_verdict, commit, changed_files, branch_ref)}\n\n"
+        f"{absence_note(absent_files, any_present)}"
+        f"{symbol_presence(commit, changed_files, branch_ref)}"
+        f"{preimage_note(det_verdict, commit, changed_files, branch_ref)}\n\n"
         f"{task}"
     )
 
 
-def _call_model(client, user):
+def call_model(client, user):
     """Stream the model and return the final text, or None on API failure."""
     try:
         with client.messages.stream(
@@ -381,7 +384,7 @@ def _call_model(client, user):
     ).strip()
 
 
-def _parse_verdict(raw):
+def parse_verdict(raw):
     """Pull (likely_affected, confidence) from the model's structured reply."""
     likely, confidence = None, "low"
     for line in raw.splitlines():
@@ -410,17 +413,17 @@ def ai_impact_analysis(
     likely_affected (True/False/None), confidence, reasoning, raw_advisory; or
     None if the SDK/credentials or the API call are unavailable.
     """
-    client = _ai_client()
+    client = ai_client()
     if client is None:
         return None
     branch_ref = f"origin/{branch}"
-    user = _build_user_prompt(
+    user = build_user_prompt(
         commit, branch, branch_ref, changed_files, introducing_commits, det_verdict
     )
-    raw = _call_model(client, user)
+    raw = call_model(client, user)
     if raw is None:
         return None
-    likely, confidence = _parse_verdict(raw)
+    likely, confidence = parse_verdict(raw)
     return {
         "likely_affected": likely,
         "confidence": confidence,

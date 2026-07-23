@@ -6,22 +6,37 @@
 # landed). No reimplementations (cve-id), no undetected blanks, no recency noise.
 # Expected result: 0 false positives, 0 false negatives.
 #
-# Run:  python3 scripts/replay_real_cve.py --file reliable_cves.txt
-#       (add --with-ai to also exercise the AI layer; ground truth is unchanged)
+# Run (from the awslc-backport dir):
+#   python3 testing/replay_real_cve.py --file testing/reliable_cves.txt \
+#       --answers testing/answer_key.txt
+#   AI is ON by default; add --no-ai for a deterministic-only sweep. Either way
+#   the ground truth (and the expected 0/0 score) is unchanged.
+#
+# How to read an entry: the comment block above each `<sha>  <subject>` line is
+# the hand-verified ground truth (which branch got the fix, and HOW), plus what
+# that case is meant to exercise. Lines that are commented out (`# UNTRIAGED ...`,
+# `# ... REMOVED:`) record cases we deliberately dropped and why, so they are not
+# re-added by mistake.
 #
 # Per-fix verified ground truth (branch -> how the fix reached it):
 
 # 9545d9de6059  CVE-2023-3446 (DH_check excessive time, oversized modulus)
+#   Exercises: the baseline AFFECTED path -- detect a fix that reached older
+#   branches by literal -x cherry-pick and newer ones by plain ancestry.
 #   -x cherry-pick: fips-2021-10-20, fips-2021-10-20-1MU, fips-2022-11-02
 #   ancestor:       fips-2024-09-27, fips-2025-09-12-lts, fips-NetOS-2024-06-11
 9545d9de6059   DH_check() excessive time with oversized modulus (CVE-2023-3446)
 
 # 1bb574f3f2e7  Excessive time checking DH q parameter value (#1121)
+#   Exercises: same baseline as above on a second real DH fix (guards against a
+#   one-off pass -- two independent CVEs must both score clean).
 #   -x cherry-pick: fips-2021-10-20, fips-2021-10-20-1MU, fips-2022-11-02
 #   ancestor:       fips-2024-09-27, fips-2025-09-12-lts, fips-NetOS-2024-06-11
 1bb574f3f2e7   Excessive time checking DH q parameter value (#1121)
 
 # e17506cdbde1  pkcs8: cap ciphertext length before allocating
+#   Exercises: the all-branches-affected case -- the fix was -x cherry-picked to
+#   every supported branch, so the bot must flag all six (miss none).
 #   -x cherry-pick: ALL six supported branches
 e17506cdbde1   pkcs8: cap ciphertext length before allocating
 

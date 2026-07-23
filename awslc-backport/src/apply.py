@@ -1,6 +1,9 @@
 """
 The ``apply`` and ``clear`` commands.
 
+Layer: command. Builds on ``gitutil`` + ``patches`` + ``verdicts``, and hands
+off to ``resolve`` when a cherry-pick conflicts; wired into the CLI by ``main``.
+
 ``apply`` cherry-picks the fix onto local ``backport/<branch>/<id>`` branches for
 review -- it never pushes, opens a PR, or auto-merges. ``clear`` drops the saved
 run state.
@@ -18,12 +21,12 @@ from patches import (
     is_empty_patch,
     resolve_patch_and_base,
 )
-from resolve import _conflict_lines, _run_resolution
+from resolve import conflict_lines, run_resolution
 from runstate import delete_patch_artifacts, run_dir
 from verdicts import bucket_branches
 
 
-def _run_cherry_picks(
+def run_cherry_picks(
     fix_sha: str, targets: Sequence[str]
 ) -> "Tuple[List[str], List[str], List[str]]":
     """Cherry-pick the fix onto each target branch, printing per-branch status.
@@ -40,7 +43,7 @@ def _run_cherry_picks(
         if status == "clean":
             if extra:
                 print("  Clean — test-only conflict auto-resolved (test hunk dropped):")
-                for line in _conflict_lines(extra):
+                for line in conflict_lines(extra):
                     print(line)
             else:
                 print("  Clean cherry-pick.")
@@ -48,7 +51,7 @@ def _run_cherry_picks(
             clean.append(branch)
         elif status == "conflict":
             print("  CONFLICT — this backport must be resolved:")
-            for line in _conflict_lines(extra):
+            for line in conflict_lines(extra):
                 print(line)
             conflict.append(branch)
         else:
@@ -57,7 +60,7 @@ def _run_cherry_picks(
     return clean, conflict, errors
 
 
-def _cleanup_after_apply(args, run, conflict, errors) -> None:
+def cleanup_after_apply(args, run, conflict, errors) -> None:
     """After a fully clean apply, delete the patch file and cached run state.
 
     Once the backport branches exist there is no reason to keep an embargoed diff
@@ -72,7 +75,7 @@ def _cleanup_after_apply(args, run, conflict, errors) -> None:
         print("\nCleaned up (clean apply): " + ", ".join(removed))
 
 
-def _select_targets(args, buckets):
+def select_targets(args, buckets):
     """Which branches to cherry-pick onto: --branches, or --all-affected.
 
     Returns a chronologically sorted list, or None if neither flag was given
@@ -105,7 +108,7 @@ def cmd_apply(args) -> int:
         branches = run["branches"] if run else bot.get_supported_branches()
         buckets = run["buckets"] if run else bucket_branches(fix_sha, branches)[2]
 
-        targets = _select_targets(args, buckets)
+        targets = select_targets(args, buckets)
         if targets is None:
             print(
                 "Specify what to apply: --all-affected, or --branches <name..>.",
@@ -129,15 +132,15 @@ def cmd_apply(args) -> int:
                 return 0
 
         print()
-        clean, conflict, errors = _run_cherry_picks(fix_sha, targets)
+        clean, conflict, errors = run_cherry_picks(fix_sha, targets)
         subject = git("log", "-1", "--format=%s", fix_sha).stdout.strip()
 
-    _cleanup_after_apply(args, run, conflict, errors)
+    cleanup_after_apply(args, run, conflict, errors)
 
     # Interactive: resolve any conflicts, then open one PR per prepared branch
     # (clean cherry-picks + resolved conflicts) -- the full local pipeline.
     if sys.stdin.isatty() and (clean or conflict):
-        return _run_resolution(
+        return run_resolution(
             args,
             fix_sha,
             subject,
@@ -151,16 +154,16 @@ def cmd_apply(args) -> int:
     print("\n" + "─" * 52)
     print("Summary\n")
 
-    def _list(title, items):
+    def print_section(title, items):
         print(f"  {title}:")
         for it in items:
             print(f"    - {it}")
         print()
 
-    _list("Clean (local backport branches)", clean or ["(none)"])
-    _list("Conflicts (need resolution)", conflict or ["(none)"])
+    print_section("Clean (local backport branches)", clean or ["(none)"])
+    print_section("Conflicts (need resolution)", conflict or ["(none)"])
     if errors:
-        _list("Errors", errors)
+        print_section("Errors", errors)
     if conflict:
         print(
             "Resolve them with:  backport resolve --commit "

@@ -1,6 +1,9 @@
 """
 Run-state persistence.
 
+Layer: persistence (leaf-ish). Builds on ``common`` only; the bridge between the
+``analyze`` and ``apply`` commands.
+
 ``analyze`` saves its result (the patch text, base ref, branch buckets) here so a
 later ``apply`` can reuse it without re-reading the patch. The state lives next to
 the tool itself -- inside the ``awslc-backport`` folder -- so it never writes into

@@ -1,6 +1,9 @@
 """
 The ``analyze`` command.
 
+Layer: command. Orchestrates ``patches`` -> ``verdicts`` -> ``render`` ->
+``runstate``; wired into the CLI by ``main``.
+
 Give every supported branch a definite verdict for a fix. Pipeline: read the
 patch -> confirm the test file -> bucket each branch deterministically -> let the
 AI decide the inconclusive ones -> print -> save the run -> delete the patch file.
@@ -16,7 +19,7 @@ from runstate import save_run
 from verdicts import bucket_branches, resolve_inconclusive
 
 
-def _delete_analyze_patch(args) -> None:
+def delete_analyze_patch(args) -> None:
     """Delete the source patch file once analysis is done (unless --keep-patch).
 
     The diff is still cached in the run file for a later ``apply``. Nothing to do
@@ -68,5 +71,5 @@ def cmd_analyze(args) -> int:
         )
 
     save_run(patch, base, branches, buckets, patch_path=args.patch)
-    _delete_analyze_patch(args)
+    delete_analyze_patch(args)
     return 0

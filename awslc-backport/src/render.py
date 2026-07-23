@@ -1,6 +1,9 @@
 """
 Rendering the analyze result.
 
+Layer: output. Builds on ``common`` only; used by ``analyze`` (and reused by
+``ci`` / ``resolve``) to present verdicts. No git or analysis logic lives here.
+
 Two output modes: a human-readable table (AFFECTED branches first, columns
 auto-sized to the widest value) followed by a copy-paste backport hint, or a
 single JSON object for scripting.
