@@ -292,7 +292,7 @@ def changed_files_with_status(commit: str) -> "Tuple[List[str], List[str]]":
       A brand-new file has no prior history, so there is no introducing commit to
       trace for it; we exclude it so introducer detection does not choke.
     """
-    output = bot.git(
+    output = bot.git_in_repo(
         ["diff-tree", "--no-commit-id", "--name-status", "-r", commit],
         capture_output=True,
         text=True,
@@ -317,7 +317,7 @@ def branch_basenames(ref: str) -> Set[str]:
     A conservative anti-false-negative guard: a same-named file under a path our
     rename trace missed means the code may still be on the branch.
     """
-    out = bot.git(
+    out = bot.git_in_repo(
         ["ls-tree", "-r", "--name-only", ref],
         check=False,
         capture_output=True,

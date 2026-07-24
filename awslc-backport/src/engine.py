@@ -49,16 +49,21 @@ def set_repo_path(path):
     REPO_PATH = os.path.abspath(path) if path else None
 
 
-def run(cmd, **kwargs):
-    """Run a command against REPO_PATH (unless an explicit cwd is given)."""
+def run_in_repo(cmd, **kwargs):
+    """Run a command against REPO_PATH (unless an explicit cwd is given).
+
+    Low-level and raw: returns the ``subprocess`` result and does NOT raise on a
+    non-zero exit. (Contrast with ``gitutil.run``/``gitutil.git``, the CLI-facing
+    wrappers that raise :class:`~common.BackportError` on failure.)
+    """
     if REPO_PATH is not None and kwargs.get("cwd") is None:
         kwargs["cwd"] = REPO_PATH
     return subprocess.run(list(cmd), **kwargs)
 
 
-def git(args, **kwargs):
-    """Run a git subcommand against REPO_PATH."""
-    return run(["git", *args], **kwargs)
+def git_in_repo(args, **kwargs):
+    """Run a git subcommand against REPO_PATH (raw; see :func:`run_in_repo`)."""
+    return run_in_repo(["git", *args], **kwargs)
 
 
 # ---------------------------------------------------------------------------
