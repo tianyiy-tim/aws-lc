@@ -93,6 +93,34 @@ class AwsLcGitHubOidcStack(Stack):
                                               },
                                           }))
 
+        # The backport bot gets its OWN pinned OIDC role, mirroring the autofix
+        # isolation above: assumable ONLY by the backport bot's workflow, so the
+        # shared Bedrock role below is never exposed to general CI jobs.
+        backport_oidc_role_name = "AwsLcGitHubActionsBackportOidcRole"
+        self.backport_oidc_role = iam.Role(self, id=backport_oidc_role_name, role_name=backport_oidc_role_name,
+                                           assumed_by=iam.WebIdentityPrincipal(self.oidc_provider.attr_arn, {
+                                               "StringEquals": {
+                                                   "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                                               },
+                                               "StringLike": {
+                                                   "token.actions.githubusercontent.com:sub": "repo:{}/{}:*".format(
+                                                       GITHUB_REPO_OWNER, (
+                                                           STAGING_GITHUB_REPO_NAME
+                                                           if (env.account == PRE_PROD_ACCOUNT)
+                                                           else GITHUB_REPO_NAME
+                                                       )
+                                                   ),
+                                                   "token.actions.githubusercontent.com:job_workflow_ref":
+                                                       "{}/{}/.github/workflows/backport-bot.yml@*".format(
+                                                           GITHUB_REPO_OWNER, (
+                                                               STAGING_GITHUB_REPO_NAME
+                                                               if (env.account == PRE_PROD_ACCOUNT)
+                                                               else GITHUB_REPO_NAME
+                                                           )
+                                                       ),
+                                               },
+                                           }))
+
         ecr_repos = [ecr.Repository.from_repository_name(self, x.replace('/', '-'), repository_name=x)
                      for x in ECR_REPOS]
 
@@ -116,9 +144,13 @@ class AwsLcGitHubOidcStack(Stack):
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
         )
 
+        # Shared Bedrock model-access role: assumed by autofix (its reasoning
+        # job) AND the backport bot, each through its own isolated OIDC role.
         self.bedrock_role = create_bedrock_role(
-            self, "AwsLcGitHubActionsBedrockRole", env, self.autofix_oidc_role)
+            self, "AwsLcGitHubActionsBedrockRole", env,
+            [self.autofix_oidc_role, self.backport_oidc_role])
         self.bedrock_role.grant_assume_role(self.autofix_oidc_role)
+        self.bedrock_role.grant_assume_role(self.backport_oidc_role)
 
         self.autofix_upload_role = create_autofix_upload_role(
             self, "AwsLcGitHubActionAutofixUploadRole", self.autofix_oidc_role,
@@ -334,9 +366,10 @@ def create_standard_github_actions_role(scope: Construct, id: str,
 
 def create_bedrock_role(scope: Construct, id: str,
                         env: typing.Union[Environment, typing.Dict[str, typing.Any]],
-                        principal: iam.IPrincipal) -> iam.Role:
+                        principals: typing.List[iam.IPrincipal]) -> iam.Role:
     return iam.Role(scope, id, role_name=id,
-                    assumed_by=iam.SessionTagsPrincipal(principal),
+                    assumed_by=iam.CompositePrincipal(
+                        *[iam.SessionTagsPrincipal(p) for p in principals]),
                     inline_policies={
                         "bedrock_policy": iam.PolicyDocument(
                             statements=[
