@@ -45,31 +45,15 @@ Two rules never bend:
 
 ## How it works
 
-There are two entry points into the same engine. Locally you go
-`analyze → apply → resolve`; in CI the bot runs `ci`, and you finish any conflicts
-with `resolve`.
+There are two ways in, both feeding the same analysis engine:
 
-```mermaid
-flowchart TD
-    fix[You write a fix] --> merged{Merged yet?}
+- **Local (pre-merge), you drive:** `analyze` (verdict per branch) → `apply`
+  (cherry-pick onto local branches) → `resolve` (fix any conflicts, open PRs).
+- **Automated (post-merge), the bot drives:** a merged PR labeled `needs-backport`
+  triggers `ci`, which opens backport PRs for the clean branches and reports the
+  conflicting ones back on the PR; you then run `resolve` to finish those.
 
-    merged -->|not yet, local| analyze[analyze: verdict per branch]
-    analyze --> apply[apply: cherry-pick to local branches]
-    apply --> conf1{conflicts?}
-    conf1 -->|no| ready[local backport branches ready]
-    conf1 -->|yes| resolveA[resolve: edit + open PRs]
-
-    merged -->|yes, PR labeled| ci[bot runs ci in GitHub Actions]
-    ci --> opened[opens backport PRs for the clean branches]
-    ci --> reported[reports conflicting branches on the PR]
-    reported --> resolveB[you run: backport resolve --pr N]
-
-    opened --> review[human reviews + merges every PR]
-    resolveA --> review
-    resolveB --> review
-    ready --> review
-```
-
+Either way, every backport ends as a normal PR that a human reviews and merges.
 Under the hood the fix is always collapsed into **one synthetic commit** (its net
 diff) before analysis, so the verdict is the same whether the work was one commit,
 many commits, or uncommitted edits.
@@ -78,22 +62,17 @@ many commits, or uncommitted edits.
 
 Everything else rests on this one step: given a fix and a single branch, what
 verdict does it get? The engine (`engine.py`) decides deterministically first, and
-only asks the AI (`ai.py`) when git history alone is inconclusive.
+only asks the AI (`ai.py`) when git history alone is inconclusive:
 
-```mermaid
-flowchart TD
-    start[Fix + one branch] --> anc{Fix already in the branch?}
-    anc -->|yes| already[already patched: skip]
-    anc -->|no| pre{Vulnerable lines still on the branch?}
-    pre -->|yes| aff[AFFECTED]
-    pre -->|no, provably gone| present{Is the code present at all?}
-    present -->|file present| unsure[UNSURE: ask the AI]
-    present -->|genuinely absent| notaff[not affected]
-    unsure --> ai{AI says?}
-    ai -->|likely affected| aff
-    ai -->|likely not| notaff
-    ai -->|uncertain or unavailable| aff
-```
+1. **Already patched?** If the fix is already in the branch's history (by ancestry
+   or patch-id), skip it.
+2. **Vulnerable code present?** If the exact lines the fix removes are still on the
+   branch, mark it **AFFECTED**.
+3. **Provably gone, but file still there?** The branch is **UNSURE**, so ask the AI:
+   likely-affected → AFFECTED, likely-not → not affected, uncertain or unavailable →
+   AFFECTED (flagged for review).
+4. **Genuinely absent?** If the changed code isn't on the branch at all, mark it
+   **not affected**.
 
 The bias is deliberate: the only confident **not affected** is "the vulnerable code
 is genuinely not here." Anything ambiguous escalates toward **AFFECTED for review**,
