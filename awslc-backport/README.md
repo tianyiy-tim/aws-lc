@@ -1,222 +1,313 @@
 # AWS-LC Backport Bot
 
-Local, **pre-merge** impact analysis and backporting for AWS-LC release branches.
-Given a fix as a **patch** (a `git diff` or `git format-patch`), it decides which
-supported branches are affected and can cherry-pick the fix onto local backport
-branches for review. Working from a patch means an embargoed security fix can be
-assessed before any public commit. **Nothing is ever pushed, merged, or turned
-into a PR** — `apply` only creates local `backport/<branch>/<id>` branches.
+## Overview
 
-## Layout
+AWS-LC maintains several long-lived **FIPS release branches** (`fips-2021-10-20`,
+`fips-2022-11-02`, … `fips-2025-09-12-lts`, `NetOS`) alongside `main`. When a
+security or correctness fix lands, it usually needs to be **backported** to every
+older branch that still carries the vulnerable code — but not to branches that
+never had it or already got the fix. Deciding that by hand is slow and easy to get
+wrong.
 
-```
-awslc-backport/
-  backport          Wrapper script (bridges AWS_REGION, runs src/main.py).
-  backport-bot.yml  Reference GitHub Actions workflow (copy into .github/workflows/).
-  model-config.json  AI model config (model id, region, max tokens, byte caps).
-  requirements.txt  Runtime deps for the AI layer (anthropic, boto3).
-  README.md         This file.
-  CLAUDE.md         Architecture / maintainer notes.
-  src/
-    main.py         Entrypoint: argument parser + subcommand dispatch.
-    settings.py     Loads model-config.json (single home for the model pin).
-    gitutil.py      Git plumbing, throwaway worktrees, cherry-pick, repo targeting.
-    patches.py      Patch -> temp commit, patch-source resolution, test-file prompt.
-    runstate.py     The analyze -> apply run-state cache.
-    verdicts.py     Deterministic bucketing + the advisory AI passes.
-    render.py       The analyze table / JSON output.
-    analyze.py      The `analyze` command.
-    apply.py        The `apply` and `clear` commands.
-    ci.py           The `ci` command (post-merge PR automation).
-    resolve.py      The `resolve` command (interactive local conflict fixing).
-    engine.py       Deterministic core: branch resolution, impact analysis
-                    (is_branch_affected, vulnerable_preimage_present), git helpers.
-    ai.py           Advisory AI auditor / tie-breaker (never changes a verdict alone).
-    common.py       Shared verdict constants + the BackportError type.
-  testing/
-    replay_real_cve.py        Real replays: roll a sandbox back to before a fix
-                              and grade the engine against what the team shipped.
-    reliable_cves.txt         Curated, hand-verified test bench.
-    answer_key.txt            Per-fix hand-verified AFFECTED branch sets.
-    fips_versions.aws-lc.json Support-window manifest (from VERSIONING.md).
-    test_engine.py            Fast unit tests for the pure engine helpers.
-```
+This tool answers the question **"which release branches does this fix belong
+on?"** and then does the mechanical backporting for you, while keeping a human in
+the loop for anything risky. It works in two modes:
 
-## Usage
+- **Local, pre-merge** (you drive): analyze a fix, cherry-pick it onto local
+  branches, and interactively resolve conflicts. Because it works from a **patch**
+  (a `git diff` / `git format-patch`) it can assess an **embargoed** fix *before*
+  any public commit.
+- **Automated, post-merge** (GitHub Actions drives): when a labeled PR merges, the
+  bot analyzes it and opens a backport PR for every affected branch.
 
-Point the tool at an AWS-LC checkout with `--repo <path>` (or `$BACKPORT_REPO_PATH`,
-else the current directory). The checkout must have the release branches fetched
-(`origin/fips-*`, `origin/NetOS`, `origin/main`).
+Two rules never bend:
 
-```bash
-# analyze the repo's current uncommitted fix (git diff HEAD):
-./backport analyze --repo <aws-lc>
+1. **Nothing auto-merges, and the bot never touches upstream `aws/aws-lc`.** Every
+   backport is a normal PR on a fork that a human must review and merge.
+2. **No silent misses.** If the deterministic checks and the AI advisory can't
+   confirm a branch is safe, it is flagged **AFFECTED for review** — never quietly
+   dropped.
 
-# or an explicit patch from anywhere:
-git -C <aws-lc> diff > fix.patch
-./backport analyze fix.patch --repo <aws-lc>
+## Table of Contents
 
-# cherry-pick onto local backport branches (no push, no PR):
-./backport apply --all-affected --repo <aws-lc>
+- [How it works](#how-it-works)
+- [How a branch verdict is decided](#how-a-branch-verdict-is-decided)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+  - [`analyze` — which branches are affected?](#analyze--which-branches-are-affected)
+  - [`apply` — cherry-pick onto local branches](#apply--cherry-pick-onto-local-branches)
+  - [`resolve` — fix conflicts and open PRs](#resolve--fix-conflicts-and-open-prs)
+  - [`ci` — post-merge automation](#ci--post-merge-automation)
+  - [`clear`](#clear)
+- [Configuration](#configuration)
+- [Files](#files)
+- [Testing](#testing)
 
-# interactively resolve any conflicts and open one PR per affected branch
-# (run from inside the checkout; no AI, in-place, and repo are all default):
-cd <aws-lc> && backport resolve --pr <number>       # or --commit <sha>
-```
+## How it works
 
-**Fixes spread across several commits.** Not every fix is one commit. `analyze`
-(and `apply`) handle this three ways:
-- **Uncommitted edits** — `analyze` with no argument diffs `git diff HEAD`, which
-  already aggregates everything you've changed.
-- **A commit range** — pass `--commit A..B` (or `A...B`, e.g.
-  `--commit origin/main...HEAD` for "everything on my branch"). The whole span is
-  analyzed as its **net change**, so N small commits behave like one squash.
-- **A single commit / patch file** — `--commit <sha>` or a patch, as before.
+There are two entry points into the same engine. Locally you go
+`analyze → apply → resolve`; in CI the bot runs `ci`, and you finish any conflicts
+with `resolve`.
 
-Internally the fix is always collapsed into one synthetic commit (its net diff)
-before analysis, so the verdict is independent of how the work was committed.
+```mermaid
+flowchart TD
+    fix[You write a fix] --> merged{Merged yet?}
 
-```bash
-./backport analyze --commit origin/main...my-fix-branch --repo <aws-lc>
+    merged -->|not yet, local| analyze[analyze: verdict per branch]
+    analyze --> apply[apply: cherry-pick to local branches]
+    apply --> conf1{conflicts?}
+    conf1 -->|no| ready[local backport branches ready]
+    conf1 -->|yes| resolveA[resolve: edit + open PRs]
+
+    merged -->|yes, PR labeled| ci[bot runs ci in GitHub Actions]
+    ci --> opened[opens backport PRs for the clean branches]
+    ci --> reported[reports conflicting branches on the PR]
+    reported --> resolveB[you run: backport resolve --pr N]
+
+    opened --> review[human reviews + merges every PR]
+    resolveA --> review
+    resolveB --> review
+    ready --> review
 ```
 
-(`./backport` is the wrapper; equivalently `python3 src/main.py <cmd>`.)
+Under the hood the fix is always collapsed into **one synthetic commit** (its net
+diff) before analysis, so the verdict is the same whether the work was one commit,
+many commits, or uncommitted edits.
 
-## Post-merge automation (GitHub Actions)
+## How a branch verdict is decided
 
-The `ci` subcommand is the automated, post-merge counterpart to the local flow:
-given a **merged** commit it analyzes every supported branch (AI layer on) and
-opens a backport PR for each AFFECTED branch. Clean cherry-picks become PRs into
-the release branch (**never auto-merged**). A conflict confined to **test/generated
-files only** is auto-resolved (the branch keeps its own tests, the source fix
-applies) and also becomes a normal PR, noted in the body — those trivial test
-clashes never reach manual resolution. Only branches with a **real source
-conflict** are **reported** — the summary lists the clashing files per branch and
-points to `resolve`; nothing is modified and no draft PR is opened.
+Everything else rests on this one step: given a fix and a single branch, what
+verdict does it get? The engine (`engine.py`) decides deterministically first, and
+only asks the AI (`ai.py`) when git history alone is inconclusive.
 
-```bash
-# what CI runs (open PRs on the fork for a merged commit):
-./backport ci --commit <merged-sha> --pr <source-pr-number>
-./backport ci --commit <merged-sha> --dry-run   # analyze + cherry-pick, no push/PR
+```mermaid
+flowchart TD
+    start[Fix + one branch] --> anc{Fix already in the branch?}
+    anc -->|yes| already[already patched: skip]
+    anc -->|no| pre{Vulnerable lines still on the branch?}
+    pre -->|yes| aff[AFFECTED]
+    pre -->|no, provably gone| present{Is the code present at all?}
+    present -->|file present| unsure[UNSURE: ask the AI]
+    present -->|genuinely absent| notaff[not affected]
+    unsure --> ai{AI says?}
+    ai -->|likely affected| aff
+    ai -->|likely not| notaff
+    ai -->|uncertain or unavailable| aff
 ```
 
-Safety: `ci` **refuses to run against upstream `aws/aws-lc`** — it only ever
-pushes branches and opens PRs on a fork (`--remote`, default `origin`).
+The bias is deliberate: the only confident **not affected** is "the vulnerable code
+is genuinely not here." Anything ambiguous escalates toward **AFFECTED for review**,
+so the tool may occasionally over-flag but never silently misses a real backport.
 
-## Resolving conflicts (`resolve`)
+## Quick start
 
-When `ci` (or `apply`) reports a conflict, `resolve` fixes it locally with a
-human in the loop. In fact, after a local `apply` hits conflicts it will offer to
-run the resolution right there (reusing the branches that just conflicted, so
-nothing is re-analyzed) — or you can invoke it directly. Given a fix (`--pr
-<number>` or `--commit <sha>`) it finds the AFFECTED branches and, for each one
-that conflicts, drops you into an interactive shell **inside that branch's `git
-worktree`** — the fix is already cherry-picked and the conflict is live, so you're
-effectively "on" the branch:
-
-```
->> Entering fips-2024-09-27 -- the fix is applied and conflicts are live here.
-   Worktree: /var/folders/.../backport-resolve-XXXX/wt
-   Edit these (they contain <<<<<<< / >>>>>>> markers):
-     - crypto/fipsmodule/dh/dh.c
-   Then type `exit` (or Ctrl-D) to continue.
-```
-
-Edit the files with your own editor, then `exit` the shell. Files you've cleaned
-up are staged for you automatically; anything still holding `<<<<<<<` / `>>>>>>>`
-markers is reported and you can re-enter. Then it moves you into the next
-conflicting branch. Clean cherry-picks are skipped (`ci`/`apply` open those).
-`git rerere` is enabled, so a resolution recorded on one branch is auto-applied to
-identical conflicts on sibling branches (e.g. the FIPS twins) — you just verify.
-When the conflicts are resolved it asks whether to open PRs, then pushes and opens
-**one normal (non-draft) PR per resolved branch**, titled `[backport <branch>]
-<fix subject>`. Finally, if it was given `--pr`, it posts an **updated summary
-comment** on the source PR — the same table `ci` produced, but with the
-previously-conflicting branches now showing ✅ and their opened backport PR. Your
-own checkout is never touched.
-
-From inside your AWS-LC checkout, the whole thing is one command:
+Run from **inside your AWS-LC checkout** (the tool defaults to the current
+directory). The checkout needs the release branches fetched
+(`git fetch origin`, giving `origin/fips-*`, `origin/NetOS`, `origin/main`).
 
 ```bash
 cd <aws-lc>
-backport resolve --pr 42        # that's it
+
+# 1. Which branches need this fix?  (verdict table per branch)
+backport analyze --commit <sha>
+
+# 2. Cherry-pick it onto local backport branches (nothing is pushed)
+backport apply --all-affected
+
+# 3. Resolve any conflicts interactively, then open one PR per branch
+backport resolve --pr <number>          # or --commit <sha>
 ```
 
-`resolve` defaults to everything you almost always want: it reads the PR plan (so
-**no AI** is needed — pass `--ai` only to re-enable it on `--reanalyze`), edits
-**in your current checkout** (`--repo` defaults to the directory you're in), and
-opens the PRs at the end. So `--no-ai`, `--in-place`, and `--repo` are no longer
-something you type.
+`backport` is a thin wrapper; `python3 src/main.py <cmd>` is equivalent. Point at a
+different checkout with `--repo <path>` (or `$BACKPORT_REPO_PATH`) if you're not
+standing in one.
 
-When given `--pr`, `resolve` reads the backport bot's own summary comment from the
-PR (a fenced `json` snapshot `ci` attaches) to learn exactly which branches
-conflicted — so it does **not** re-run the impact analysis and targets precisely
-what `ci` reported. Pass `--reanalyze` to ignore the comment and recompute locally
-instead (deterministic by default; add `--ai` for the AI advisory); this is also
-the automatic fallback when there is no bot summary (e.g. `--commit`).
+## Commands
 
-`--in-place` (the default) checks each conflicting branch out (detached) in your
-working repo, so your already-open IDE window shows the conflict live; you fix it,
-answer the prompt, and it restores your original branch when done. It needs a
-clean working tree. When a conflict was already solved before, `rerere` re-applies
-it and `resolve` says so ("auto-applied by rerere, just verify"). Prefer isolation?
-`--worktree` does it in a throwaway worktree instead (nothing touches your
-checkout). Tip: run from a checkout where the tool lives *outside* the repo (or
-use `--worktree`) to avoid briefly hiding `awslc-backport/` while a release branch
-is checked out.
+### `analyze` — which branches are affected?
 
-Like `ci`, `resolve` targets a fork only. It is interactive, so run it in a
-terminal (not a pipe/CI).
-
-To wire it up, copy `backport-bot.yml` into the fork's `.github/workflows/`. It
-triggers when a PR is merged carrying the `needs-backport` label, and needs a
-`BEDROCK_ROLE_ARN` secret (OIDC role for the AI layer). Without it the tool still
-runs deterministically and flags anything it cannot confirm as AFFECTED.
-
-`analyze` gives every supported branch a definite verdict — AFFECTED / not
-affected / already patched. The deterministic check (ancestry + patch-id +
-pre-image + file presence) decides the clear branches; anything it cannot confirm
-is sent to the AI advisory, and if the AI is uncertain or unavailable the branch
-is flagged AFFECTED for review — **never silently dropped**. `--no-ai` runs
-deterministic-only (inconclusive branches are flagged AFFECTED). The run is saved
-so a later `apply` reuses it.
-
-### AWS credentials (for the AI layer)
-
-The advisory layer uses Amazon Bedrock via the `anthropic` SDK and the boto3
-default credential chain. If the SDK/credentials are unavailable, the AI path
-skips and the deterministic engine runs alone. `BACKPORT_DISABLE_AI=1` forces it off.
-
-The model pin and Bedrock call knobs (model id, region, max tokens, context byte
-caps) live in one place, **`model-config.json`** at the tool root, loaded by
-`src/settings.py`. To change the model, edit that file; environment variables
-(`BEDROCK_MODEL_ID`, `AWS_REGION`, `BEDROCK_MAX_TOKENS`) override it for a run.
-
-## Testing
+Gives **every** supported branch a definite verdict — **AFFECTED / not affected /
+already patched** — and saves the run so `apply` can reuse it.
 
 ```bash
-# Unit tests (no repo, creds, or network) -- runs every testing/test_*.py:
-python3 -m unittest discover -s testing -p 'test_*.py'
-#   test_engine.py         pure engine helpers (whitespace/comment/date logic)
-#   test_plan_roundtrip.py  the ci -> resolve PR-plan hand-off contract
-
-# Real replays (needs a local aws-lc clone; set AWS_LC_REPO or pass --repo):
-python3 testing/replay_real_cve.py --file testing/reliable_cves.txt \
-    --answers testing/answer_key.txt --no-ai
-python3 testing/replay_real_cve.py 3107 --no-ai      # a single fix
+backport analyze --commit <sha>     # from an existing commit (base defaults to <sha>^)
+backport analyze fix.patch          # from a git diff / format-patch file
+backport analyze                    # from your uncommitted changes (git diff HEAD)
 ```
 
-## Key environment variables
+**Fixes spread across several commits** are handled three ways, all collapsed to
+the fix's net change before analysis:
+
+- **Uncommitted edits** — `analyze` with no argument diffs `git diff HEAD`.
+- **A commit range** — `--commit A..B`, or `A...B` (e.g.
+  `--commit origin/main...HEAD` for "everything on my branch").
+- **A single commit / patch file** — `--commit <sha>` or a patch path.
+
+The deterministic check (ancestry + patch-id + vulnerable pre-image + file
+presence) decides the clear branches; the rest go to the AI advisory. `--no-ai`
+runs deterministic-only, flagging every inconclusive branch AFFECTED for review.
+Add `--json` for machine-readable output.
+
+### `apply` — cherry-pick onto local branches
+
+Cherry-picks the fix onto local `backport/<branch>/<id>` branches for review.
+**Nothing is pushed, merged, or turned into a PR.**
+
+```bash
+backport apply --all-affected              # every AFFECTED branch from the last analyze
+backport apply --branches fips-2022-11-02  # specific branches
+```
+
+Each pick is one of three outcomes:
+
+- **Clean** — lands on `backport/<branch>/<id>`.
+- **Test-only conflict** — if only a test/generated file clashes, the branch keeps
+  its own tests, the source fix applies, and it still counts as clean.
+- **Real conflict** — the pick is aborted (nothing left behind). If you're in a
+  terminal, `apply` rolls straight into `resolve` for the conflicting branches (no
+  re-analysis); otherwise it reports them for you to resolve later.
+
+### `resolve` — fix conflicts and open PRs
+
+The interactive fixer for branches that conflict. The common case is one command:
+
+```bash
+cd <aws-lc>
+backport resolve --pr <number>      # that's it
+```
+
+It reads the backport bot's plan from the PR (see [`ci`](#ci--post-merge-automation)),
+so it targets exactly the branches that conflicted **without re-analyzing** — which
+is why **no AI is needed here**. For each conflicting branch it checks the branch
+out (detached) in your working repo with the conflict live, so your open editor
+shows it. You fix the files and `exit`; anything still holding `<<<<<<<` markers is
+reported so you can re-enter. When done it asks before pushing, then opens **one
+normal (non-draft) PR per resolved branch** and updates the summary comment on the
+source PR.
+
+Sensible defaults mean you rarely type flags:
+
+| Default behavior | Flag to change it |
+|---|---|
+| Reads the PR plan; **no AI** | `--reanalyze` recomputes locally; `--ai` adds the AI advisory |
+| Edits **in your current checkout** | `--worktree` uses an isolated throwaway worktree |
+| Operates on the **current directory** | `--repo <path>` targets another checkout |
+
+`git rerere` is enabled, so once you resolve a conflict it is auto-applied to any
+**identical** conflict on a sibling branch (e.g. the FIPS twins) — you just verify.
+`resolve` is interactive (run it in a terminal) and, like `ci`, targets a fork only.
+
+### `ci` — post-merge automation
+
+The automated counterpart, run by GitHub Actions. Given a **merged** commit it
+analyzes every branch and opens a backport PR for each AFFECTED one.
+
+```bash
+backport ci --commit <merged-sha> --pr <source-pr-number>
+backport ci --commit <merged-sha> --dry-run   # analyze + cherry-pick, no push/PR
+```
+
+Per branch: a clean cherry-pick (or a test-only conflict) becomes a **normal PR**
+into the release branch (never auto-merged); a **real conflict** is only
+**reported**. It then posts a summary comment on the source PR containing:
+
+- a **human-readable table** of every branch and its outcome, and
+- a collapsed **machine-readable `json` plan** (tagged `backport_bot_plan`) that
+  `resolve` reads back to fix the conflicting branches.
+
+`ci` **refuses to run against upstream `aws/aws-lc`** — it only pushes and opens
+PRs on a fork (`--remote`, default `origin`).
+
+**Wiring it up:** copy `backport-bot.yml` into the fork's `.github/workflows/`. It
+triggers when a PR merges carrying the `needs-backport` label and uses a
+`BEDROCK_ROLE_ARN` secret for the AI layer. Without the secret the tool still runs
+deterministically and flags anything it cannot confirm as AFFECTED.
+
+### `clear`
+
+Removes the saved run state (`.backport-runs/`) from the tool folder.
+
+```bash
+backport clear
+```
+
+## Configuration
+
+**Pointing at a repo.** In order of precedence: `--repo <path>`, then
+`$BACKPORT_REPO_PATH`, then the current working directory.
+
+**AI layer (Amazon Bedrock).** The advisory layer uses Bedrock via the `anthropic`
+SDK and the boto3 default credential chain. If the SDK or credentials are
+unavailable, the AI path is skipped and the deterministic engine runs alone.
+`BACKPORT_DISABLE_AI=1` forces it off. The model pin and call knobs live in one
+place — **`model-config.json`** at the tool root, loaded by `src/settings.py`. To
+change the model, edit that file; environment variables override it per run.
+
+**Environment variables:**
 
 | Name | Purpose |
 |---|---|
 | `BACKPORT_REPO_PATH` | Default AWS-LC checkout (else `--repo`, else cwd). |
-| `AWS_LC_REPO` | Repo used by the replay harness. |
+| `AWS_LC_REPO` | Repo used by the replay test harness. |
 | `BACKPORT_VERSIONS_MANIFEST` | FIPS branch manifest path (default `fips_versions.json`). |
 | `BACKPORT_BRANCH_PREFIXES` | Supported-branch prefixes when no manifest is present. |
 | `BACKPORT_MAINLINE_REF` | Mainline ref (default `origin/main`). |
 | `BACKPORT_GENERATED_PATHS` | Generated-file prefixes excluded from patch-id matching (default `generated-src`). |
 | `BEDROCK_MODEL_ID` | Override the model pinned in `model-config.json`. |
+| `AWS_REGION`, `BEDROCK_MAX_TOKENS` | Override the region / token cap from `model-config.json`. |
 | `BACKPORT_DISABLE_AI` | `1` forces the deterministic-only path. |
 
-See `CLAUDE.md` for the architecture and the rationale behind each analysis path.
+## Files
+
+Each module has one job; see `CLAUDE.md` for the architecture and the rationale
+behind each analysis path.
+
+```
+awslc-backport/
+  backport           Wrapper script (bridges AWS_REGION, runs src/main.py).
+  backport-bot.yml   Reference GitHub Actions workflow (copy into .github/workflows/).
+  model-config.json  AI model config (model id, region, max tokens, byte caps).
+  requirements.txt   Runtime deps for the AI layer (anthropic, boto3).
+  README.md          This file.
+  CLAUDE.md          Architecture / maintainer notes.
+  src/
+    main.py       Entrypoint: argument parser + subcommand dispatch.
+    analyze.py    The `analyze` command.
+    apply.py      The `apply` and `clear` commands.
+    ci.py         The `ci` command (post-merge PR automation).
+    resolve.py    The `resolve` command (interactive local conflict fixing).
+    verdicts.py   Deterministic bucketing + the advisory AI passes.
+    engine.py     Deterministic core: branch resolution, impact analysis
+                  (is_branch_affected, vulnerable_preimage_present), git helpers.
+    ai.py         Advisory AI auditor / tie-breaker (never changes a verdict alone).
+    gitutil.py    Git plumbing, throwaway worktrees, cherry-pick, repo targeting.
+    patches.py    Patch -> temp commit, patch-source resolution, test-file prompt.
+    runstate.py   The analyze -> apply run-state cache.
+    render.py     The analyze table / JSON output.
+    settings.py   Loads model-config.json (single home for the model pin).
+    common.py     Shared verdict constants + the BackportError type.
+  testing/
+    test_engine.py            Fast unit tests for the pure engine helpers.
+    test_plan_roundtrip.py    Locks the ci -> resolve PR-plan hand-off.
+    replay_real_cve.py        Real replays: roll a sandbox back to before a fix
+                              and grade the engine against what the team shipped.
+    reliable_cves.txt         Curated, hand-verified test bench.
+    answer_key.txt            Per-fix hand-verified AFFECTED branch sets.
+    fips_versions.aws-lc.json Support-window manifest (from VERSIONING.md).
+```
+
+## Testing
+
+```bash
+# Unit tests (no repo, credentials, or network) -- runs every testing/test_*.py:
+python3 -m unittest discover -s testing -p 'test_*.py'
+#   test_engine.py          pure engine helpers (whitespace/comment/date logic)
+#   test_plan_roundtrip.py  the ci -> resolve PR-plan hand-off contract
+
+# Real replays (needs a local aws-lc clone; set AWS_LC_REPO or pass --repo).
+# Rolls a throwaway sandbox back to before each fix and grades the engine
+# against what the team actually shipped:
+python3 testing/replay_real_cve.py --file testing/reliable_cves.txt \
+    --answers testing/answer_key.txt --no-ai
+python3 testing/replay_real_cve.py 3107 --no-ai      # a single fix
+```
