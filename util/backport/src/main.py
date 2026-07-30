@@ -18,6 +18,7 @@ import sys
 from typing import Optional, Sequence
 
 from commands.analyze import cmd_analyze
+from commands.publish import cmd_publish
 from util.config import BackportError
 from util.git import target_repo
 
@@ -62,6 +63,28 @@ def add_analyze(sub) -> None:
     p.set_defaults(func=cmd_analyze)
 
 
+def add_publish(sub) -> None:
+    """publish: open a backport PR per affected branch (what CI runs)."""
+    p = sub.add_parser(
+        "publish",
+        help="open backport PRs on the fork for a merged commit (what CI runs)",
+    )
+    p.add_argument("--commit", required=True, help="merged commit SHA to back-port")
+    p.add_argument("--pr", help="source PR number (for cross-linking / comments)")
+    p.add_argument(
+        "--remote",
+        default="origin",
+        help="fork remote to push branches / open PRs on (default origin)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="analyze and cherry-pick locally but do not push or open PRs",
+    )
+    add_common(p)
+    p.set_defaults(func=cmd_publish, json=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``backport`` argument parser (analyze / apply / publish / clear)."""
     ap = argparse.ArgumentParser(
@@ -70,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     add_analyze(sub)
+    add_publish(sub)
     return ap
 
 

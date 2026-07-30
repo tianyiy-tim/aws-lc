@@ -9,10 +9,19 @@ Only imports util.config, so it can't cause import cycles.
 """
 
 import os
+import shutil
 import subprocess
-from typing import Dict, List, Optional, Sequence, Tuple
+import tempfile
+from contextlib import contextmanager
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
-from util.config import MAINLINE_REF, MAX_DIFF_BYTES, MAX_FILE_BYTES, BackportError
+from util.config import (
+    MAINLINE_REF,
+    MAX_DIFF_BYTES,
+    MAX_FILE_BYTES,
+    BackportError,
+    is_test_or_generated_file,
+)
 
 
 # --- Repository targeting -------------------------------------------------
@@ -90,6 +99,25 @@ def ref_exists(ref: str) -> bool:
     return git("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0
 
 
+@contextmanager
+def temp_worktree(base: str, prefix: str = "backport-") -> "Iterator[str]":
+    """Check *base* out in a throwaway worktree and yield its path.
+
+    Lets us cherry-pick without touching the user's files. The worktree is deleted
+    afterwards, but any commits made in it stay in the repo's object store, which
+    is all we need.
+    """
+    scratch_dir = tempfile.mkdtemp(prefix=prefix)
+    worktree = os.path.join(scratch_dir, "wt")
+    try:
+        git("worktree", "add", "--detach", "--quiet", worktree, base)
+        yield worktree
+    finally:
+        git("worktree", "remove", "--force", worktree, check=False)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+        git("worktree", "prune", check=False)
+
+
 # --- Cherry-pick primitive (shared by `apply` and `publish`) --------------
 
 
@@ -101,6 +129,122 @@ BOT_IDENTITY = (
     "-c",
     "user.email=backport-cli@local",
 )
+
+# git status porcelain XY codes for unmerged paths -> git's long-format wording.
+_CONFLICT_KIND = {
+    "DD": "both deleted",
+    "AU": "added by us",
+    "UD": "deleted by them",
+    "UA": "added by them",
+    "DU": "deleted by us",
+    "AA": "both added",
+    "UU": "both modified",
+}
+
+
+def unmerged_files(wt: str) -> List[dict]:
+    """Files still conflicted in *wt*, as ``{"path", "kind"}``.
+
+    *kind* is git's own wording ("both modified", "deleted by us", ...). Re-call it
+    after each `git add` to see what's left -- that's how `resolve` tracks progress.
+    """
+    out = git("status", "--porcelain", cwd=wt).stdout
+    files: List[dict] = []
+    for line in out.splitlines():
+        xy, path = line[:2], line[3:].strip()
+        if "U" in xy or xy in ("AA", "DD"):
+            files.append({"path": path, "kind": _CONFLICT_KIND.get(xy, "conflict")})
+    return files
+
+
+def resolve_commit(commit_ish: str) -> "Tuple[str, str]":
+    """Resolve *commit_ish* to ``(sha, subject)``.
+
+    A merge commit's own diff is empty -- the change is on the side that got merged
+    in -- so we switch to its second parent and say so. Raises BackportError if the
+    commit isn't here.
+    """
+    fix = git("rev-parse", "--verify", f"{commit_ish}^{{commit}}", check=False)
+    if fix.returncode != 0:
+        raise BackportError(f"commit '{commit_ish}' not found in the checkout.")
+    fix_sha = fix.stdout.strip()
+    parents = git("rev-list", "--parents", "-n", "1", fix_sha).stdout.split()
+    if len(parents) > 2:  # sha + 2+ parent shas => merge commit
+        merged_head = git("rev-parse", f"{fix_sha}^2").stdout.strip()
+        print(
+            f"note: {fix_sha[:10]} is a merge commit; analyzing the merged-in "
+            f"commit {merged_head[:10]} instead."
+        )
+        fix_sha = merged_head
+    subject = git("log", "-1", "--format=%s", fix_sha).stdout.strip()
+    return fix_sha, subject
+
+
+def cherry_pick_local(
+    fix_sha: str, branch: str, run_id: str
+) -> "Tuple[str, Optional[str], List[dict]]":
+    """Cherry-pick *fix_sha* onto ``origin/<branch>`` in a throwaway worktree.
+
+    Never pushes or opens a PR. Returns ``(status, detail, extra)``:
+      clean    -> branch `backport/<branch>/<run_id>` created. *extra* lists any
+                  test/generated files whose conflicting hunks we dropped.
+      conflict -> a real source conflict; aborted, nothing left behind. *extra* is
+                  the conflicting files. Use `resolve` to fix it by hand.
+      error    -> missing branch, or git failed.
+    """
+    ref = f"origin/{branch}"
+    if not ref_exists(ref):
+        return "error", f"{ref} not found", []
+    local_branch = f"backport/{branch}/{run_id}"
+    try:
+        with temp_worktree(ref, prefix="backport-cp-") as wt:
+            pick = git("cherry-pick", fix_sha, check=False, cwd=wt)
+            dropped: List[dict] = []
+            if pick.returncode != 0:
+                conflicts = unmerged_files(wt)
+                # Only tests/generated files clashed, so the actual fix applied.
+                # Keep the branch's versions of those and finish the pick -- a test
+                # clash shouldn't force manual resolution.
+                if (
+                    conflicts
+                    and all(is_test_or_generated_file(c["path"]) for c in conflicts)
+                    and drop_and_continue(wt, conflicts)
+                ):
+                    dropped = conflicts
+                else:
+                    git("cherry-pick", "--abort", check=False, cwd=wt)
+                    return "conflict", None, conflicts
+            new_sha = git("rev-parse", "HEAD", cwd=wt).stdout.strip()
+            git("branch", "-f", local_branch, new_sha)
+            return "clean", local_branch, dropped
+    except BackportError as exc:
+        return "error", str(exc), []
+
+
+def drop_and_continue(wt: str, conflicts: List[dict]) -> bool:
+    """Finish a cherry-pick that only clashed on tests/generated files, by keeping
+    the branch's version of each. False if it couldn't finish, so the caller aborts
+    and treats it as a real conflict."""
+    for c in conflicts:
+        path = c["path"]
+        # Take the target branch's version; if the branch deleted the file, drop it.
+        if git("checkout", "HEAD", "--", path, check=False, cwd=wt).returncode != 0:
+            git("rm", "--force", "--quiet", "--", path, check=False, cwd=wt)
+        else:
+            git("add", "--", path, cwd=wt)
+    # Nothing of the fix left staged means there's nothing to backport.
+    if git("diff", "--cached", "--quiet", check=False, cwd=wt).returncode == 0:
+        return False
+    cont = git(
+        *BOT_IDENTITY,
+        "-c",
+        "core.editor=true",
+        "cherry-pick",
+        "--continue",
+        check=False,
+        cwd=wt,
+    )
+    return cont.returncode == 0
 
 
 # --- Which commit(s) are we analyzing? ------------------------------------
