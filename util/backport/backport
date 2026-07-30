@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Wrapper so the tool can be run as `util/backport/backport <cmd>` from the top of
+# an AWS-LC checkout.
+#
+# It resolves its own location (so it doesn't care what your working directory is),
+# bridges AWS_REGION -> AWS_DEFAULT_REGION (boto3 reads the latter, so the AI layer
+# picks up whichever you set), and forwards every argument verbatim.
+#
+# The tool operates on the repo you're standing in. Pass --repo <path> to target a
+# different checkout.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -n "${AWS_REGION:-}" ] && [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+  export AWS_DEFAULT_REGION="$AWS_REGION"
+fi
+
+exec python3 "$here/src/main.py" "$@"

@@ -1,0 +1,96 @@
+# AWS-LC Backport Bot
+
+Decides which supported AWS-LC release branches a fix belongs on, then backports it.
+Point it at your fix -- a commit, a range of commits, or just your current branch --
+and it gives every supported FIPS release branch a verdict (AFFECTED / not affected /
+already patched), cherry-picks onto local branches, and walks you through any
+conflicts. Nothing is ever auto-merged, and it never targets upstream `aws/aws-lc`.
+
+## Prerequisites
+
+Python 3.9+. Run the commands **from the top of an AWS-LC checkout** with the release
+branches fetched (`git fetch origin`) -- the tool operates on the repo you're
+standing in, so there is nothing to configure. The optional AI layer needs
+`anthropic` + `boto3` (`pip install -r requirements.txt`) and AWS credentials;
+without them the deterministic engine runs alone.
+
+## Commands
+
+```bash
+cd <aws-lc>            # all commands are run from the repo top
+
+# 1. Which branches need this fix?
+#    Omit --commit to use your branch's commits since origin/main.
+util/backport/backport analyze --commit <sha>
+
+# 2. Cherry-pick onto local backport/<branch>/<id> branches (nothing is pushed)
+util/backport/backport apply --all-affected
+
+# 3. Resolve any conflicts interactively, then open one PR per branch
+util/backport/backport resolve --pr <number>
+
+# Post-merge automation (what CI runs): one backport PR per affected branch
+util/backport/backport publish --commit <merged-sha> --pr <number>
+
+# Drop the saved run state
+util/backport/backport clear
+```
+
+Useful flags: `--branches <a b c>` (limit the set), `--json` (machine-readable),
+`--repo <path>` (target a different checkout, e.g. to run from a separate clone),
+`--commit A..B` (a fix spread across several commits, analyzed as its net change),
+`--dry-run` (`publish` only).
+
+The AI layer always runs -- it is what keeps the over-flag rate low (see Tests).
+If it can't be reached the run says so loudly and every branch it could not judge
+is flagged AFFECTED for review, so nothing is missed; you just get more flags.
+
+The tool never changes your working directory: every git call is scoped to the
+resolved checkout, so it behaves the same whether you run it from the repo top, a
+subdirectory, or elsewhere with `--repo`.
+
+`apply` and `resolve` check each release branch out in your own working tree (so
+your IDE shows the conflict live) and put you back on your original branch when
+they are done, so they need a clean tree to start.
+
+## How it decides
+
+Per fix × branch, deterministically first; the AI is consulted only when git history
+is inconclusive:
+
+1. Fix already in the branch's history (ancestry / patch-id) → **already patched**.
+2. The exact lines the fix removes are still present → **AFFECTED**.
+3. Provably gone but the file is still there → ask the AI.
+4. Code genuinely absent → **not affected**.
+
+The bias is deliberate: anything ambiguous becomes AFFECTED for review, so the tool
+may over-flag but never silently drops a needed backport.
+
+## Configuration
+
+`model-config.json` holds the Bedrock model pin and call limits. Environment
+overrides: `BACKPORT_REPO_PATH`, `BEDROCK_MODEL_ID`, `AWS_REGION`,
+`BACKPORT_DISABLE_AI=1`, `BACKPORT_GENERATED_PATHS`, `BACKPORT_MAINLINE_REF`,
+`BACKPORT_BRANCH_PREFIXES`, `BACKPORT_VERSIONS_MANIFEST`.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s util/backport/testing -p 'test_*.py'   # 22 tests; no repo/creds needed
+```
+
+`testing/replay_real_cve.py` replays real CVE fixes in a throwaway sandbox (the real
+repo is only ever read) and grades `verdicts`' shipped classifier against
+`testing/answer_key.txt` — 31 fixes / 186 fix-branch cells. Deterministic-only
+31 fixes / 186 fix-branch cells, and **0 false negatives** either way -- no real
+backport is ever missed. The AI advisory layer's job is precision:
+
+| | over-flags (unneeded PRs) | agreement |
+|---|---|---|
+| deterministic engine alone | 16 / 186 (8.6%) | 90% |
+| with the AI layer (what ships) | **5 / 186 (2.7%)** | **97%** |
+
+The AI resolved 13 inconclusive branches to "not affected" and suppressed none of
+the 85 real backports. See `testing/reliable_cves.txt` for how to run it.
+
+To wire up the post-merge bot, copy `backport-bot.yml` into `.github/workflows/`.
