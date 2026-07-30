@@ -185,3 +185,14 @@ def save_run(
             indent=2,
         )
     )
+
+
+def load_run() -> dict:
+    """Load the saved run, or raise if there isn't one."""
+    path = run_file()
+    if not path.exists():
+        raise BackportError(
+            "no saved run found. Run `backport analyze` first, or name the fix "
+            "with --commit <ref>."
+        )
+    return json.loads(path.read_text())

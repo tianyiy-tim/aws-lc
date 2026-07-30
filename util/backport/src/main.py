@@ -18,6 +18,7 @@ import sys
 from typing import Optional, Sequence
 
 from commands.analyze import cmd_analyze
+from commands.apply import cmd_apply, cmd_clear
 from commands.publish import cmd_publish
 from commands.resolve import cmd_resolve
 from util.config import BackportError
@@ -64,6 +65,19 @@ def add_analyze(sub) -> None:
     p.set_defaults(func=cmd_analyze)
 
 
+def add_apply(sub) -> None:
+    """apply: cherry-pick onto local branches for review."""
+    p = sub.add_parser("apply", help="cherry-pick the fix onto local branches")
+    p.add_argument("--branches", nargs="+", help="branches to apply to")
+    p.add_argument(
+        "--all-affected", action="store_true", help="apply to every AFFECTED branch"
+    )
+    p.add_argument("--commit", help=f"{_COMMIT_HELP} (default: the last analyzed run)")
+    p.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    add_common(p)
+    p.set_defaults(func=cmd_apply)
+
+
 def add_publish(sub) -> None:
     """publish: open a backport PR per affected branch (what CI runs)."""
     p = sub.add_parser(
@@ -103,6 +117,16 @@ def add_resolve(sub) -> None:
     p.set_defaults(func=cmd_resolve, json=False)
 
 
+def add_clear(sub) -> None:
+    """clear: delete the saved run."""
+    p = sub.add_parser(
+        "clear",
+        help="remove the saved run state (.backport-runs/) from the tool folder",
+    )
+    add_common(p)
+    p.set_defaults(func=cmd_clear)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``backport`` argument parser (analyze / apply / publish / clear)."""
     ap = argparse.ArgumentParser(
@@ -111,8 +135,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     add_analyze(sub)
+    add_apply(sub)
     add_publish(sub)
     add_resolve(sub)
+    add_clear(sub)
     return ap
 
 
