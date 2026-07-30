@@ -72,6 +72,14 @@ def emit_analysis(
         print_backport_hint(buckets)
 
 
+def print_section(title, items) -> None:
+    """One titled, indented block of a run summary (``apply`` / ``resolve``)."""
+    print(f"  {title}:")
+    for item in items:
+        print(f"    - {item}")
+    print()
+
+
 def ask_yn(prompt: str) -> bool:
     """Prompt until the user answers Y or N. Returns True for Y."""
     while True:

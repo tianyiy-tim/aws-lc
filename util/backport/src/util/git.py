@@ -157,6 +157,32 @@ def unmerged_files(wt: str) -> List[dict]:
     return files
 
 
+def file_has_conflict_markers(path: str) -> bool:
+    """True if *path* still has conflict markers in it.
+
+    Checked before staging a file the user says is resolved, so a half-edited file
+    never gets committed.
+    """
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("<<<<<<<") or line.startswith(">>>>>>>"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def enable_rerere() -> None:
+    """Turn on git rerere, so resolving a conflict once reuses it next time.
+
+    Handy for the FIPS twin branches, which usually conflict identically. rerere's
+    autoupdate is left OFF on purpose: the reused resolution stays unstaged so
+    `resolve` can still show it to the user instead of committing it silently.
+    """
+    git("config", "rerere.enabled", "true", check=False)
+
+
 def resolve_commit(commit_ish: str) -> "Tuple[str, str]":
     """Resolve *commit_ish* to ``(sha, subject)``.
 

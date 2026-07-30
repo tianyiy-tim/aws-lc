@@ -19,6 +19,7 @@ from typing import Optional, Sequence
 
 from commands.analyze import cmd_analyze
 from commands.publish import cmd_publish
+from commands.resolve import cmd_resolve
 from util.config import BackportError
 from util.git import target_repo
 
@@ -85,6 +86,23 @@ def add_publish(sub) -> None:
     p.set_defaults(func=cmd_publish, json=False)
 
 
+def add_resolve(sub) -> None:
+    """resolve: fix conflicting backports by hand, one branch at a time."""
+    p = sub.add_parser(
+        "resolve",
+        help="interactively resolve backport conflicts locally, one PR per branch",
+    )
+    p.add_argument("--commit", help="fix commit SHA to backport")
+    p.add_argument("--pr", help="source PR number to backport (resolved via gh)")
+    p.add_argument(
+        "--remote",
+        default="upstream",
+        help="fork remote to push branches / open PRs on (default origin)",
+    )
+    add_common(p)
+    p.set_defaults(func=cmd_resolve, json=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``backport`` argument parser (analyze / apply / publish / clear)."""
     ap = argparse.ArgumentParser(
@@ -94,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
     add_analyze(sub)
     add_publish(sub)
+    add_resolve(sub)
     return ap
 
 
